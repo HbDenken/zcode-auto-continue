@@ -1,0 +1,30 @@
+{
+  "description": "zcode-auto-continue: 拉起守护进程、注入会话上下文、回合结束时实时续跑",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "process",
+            "command": "node",
+            "args": ["${ZCODE_PLUGIN_ROOT}/hooks/session-start.mjs"],
+            "timeoutMs": 5000
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "process",
+            "command": "node",
+            "args": ["${ZCODE_PLUGIN_ROOT}/hooks/stop.mjs"],
+            "timeoutMs": 15000,
+            "statusMessage": "auto-continue: 检测回合结束原因，临时错误则自动继续"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "locale": "zh",
+  "continueText": "继续",
+  "graceMs": 3000,
+  "cooldownMs": 20000,
+  "maxConsecutive": 3,
+  "verbose": true,
+  "classify": true,
+  "retryableErrorPatterns": "",
+  "backoffFactor": 2,
+  "backoffMaxMs": 300000,
+  "paused": false,
+  "loopGuardRepeats": 3,
+  "maxErrorLength": 500,
+  "bannerMaxLength": 80,
+  "minErrorCoverage": 0.2,
+  "truncationGuard": true,
+  "minTruncationLength": 300
+}
