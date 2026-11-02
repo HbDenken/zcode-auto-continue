@@ -16,14 +16,26 @@ import {
   loopGuardHash,
 } from '../lib/core.mjs';
 import { readState, writeState, sessionEntry, consumeSuppress, emptyState, pruneSessions, STATE_DIR } from '../lib/state.mjs';
-import { unlinkSync } from 'node:fs';
+import { writeFileSync, unlinkSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { normalizeInput, decide } from '../hooks/stop.mjs';
+import { parseDuration, parseCommand } from '../hooks/user-prompt-submit.mjs';
+import { classifyTurn } from '../lib/watcher.mjs';
 
 let n = 0;
 function t(name, fn) {
   fn();
   n++;
   console.log(`ok ${n} - ${name}`);
+}
+
+/** 写一个临时 transcript JSONL，返回路径（调用方负责 unlinkSync）。 */
+let trSeq = 0;
+function writeTranscript(entries) {
+  const p = join(tmpdir(), `ac-selfcheck-${process.pid}-${trSeq++}.jsonl`);
+  writeFileSync(p, entries.map((e) => JSON.stringify({ message: e })).join('\n'));
+  return p;
 }
 
 // ---- resolveConfig ----
@@ -362,12 +374,45 @@ t('decide: truncation → block with truncation text', () => {
   assert.equal(d.action, 'block');
   assert.equal(d.kind, 'truncation');
 });
-t('decide: empty response → block', () => {
+t('decide: empty message + readable transcript(no text, no tool) → block empty', () => {
   const cfg = resolveConfig({});
   const entry = sessionEntry(emptyState(), 's');
-  const d = decide({ input: { lastMessage: '' }, entry, cfg, maxHookRetries: 3, loopGuardRepeats: 3 });
+  const tp = writeTranscript([{ role: 'assistant', content: [{ type: 'step-start' }] }]);
+  const d = decide({ input: { lastMessage: '', transcriptPath: tp }, entry, cfg, maxHookRetries: 3, loopGuardRepeats: 3 });
   assert.equal(d.action, 'block');
   assert.equal(d.kind, 'empty');
+  unlinkSync(tp);
+});
+t('decide: empty message + transcript shows tool call → pass (regression: 误判空响应)', () => {
+  const cfg = resolveConfig({});
+  const entry = sessionEntry(emptyState(), 's');
+  const tp = writeTranscript([{ role: 'assistant', content: [{ type: 'tool', tool: 'Bash' }] }]);
+  const d = decide({ input: { lastMessage: '', transcriptPath: tp }, entry, cfg, maxHookRetries: 3, loopGuardRepeats: 3 });
+  assert.equal(d.action, 'pass');
+  unlinkSync(tp);
+});
+t('decide: empty message + transcript has text → pass', () => {
+  const cfg = resolveConfig({});
+  const entry = sessionEntry(emptyState(), 's');
+  const tp = writeTranscript([{ role: 'assistant', content: [{ type: 'text', text: '已完成。' }] }]);
+  const d = decide({ input: { lastMessage: '', transcriptPath: tp }, entry, cfg, maxHookRetries: 3, loopGuardRepeats: 3 });
+  assert.equal(d.action, 'pass');
+  unlinkSync(tp);
+});
+t('decide: empty message + no transcript → pass (保守放行)', () => {
+  const cfg = resolveConfig({});
+  const entry = sessionEntry(emptyState(), 's');
+  const d = decide({ input: { lastMessage: '', transcriptPath: '/nonexistent/t.jsonl' }, entry, cfg, maxHookRetries: 3, loopGuardRepeats: 3 });
+  assert.equal(d.action, 'pass');
+});
+t('decide: stopHookActive forces repeat counting → give-up', () => {
+  const cfg = resolveConfig({});
+  const entry = sessionEntry(emptyState(), 's');
+  const tp = writeTranscript([{ role: 'assistant', content: [{ type: 'step-start' }] }]);
+  entry.repeats = 3;
+  const d = decide({ input: { lastMessage: '', transcriptPath: tp, stopHookActive: true }, entry, cfg, maxHookRetries: 3, loopGuardRepeats: 3 });
+  assert.equal(d.action, 'give-up');
+  unlinkSync(tp);
 });
 t('decide: normal message → pass', () => {
   const cfg = resolveConfig({});
@@ -399,3 +444,69 @@ t('decide: cooldown in-progress → cooldown (no sleep)', () => {
   assert.equal(d.action, 'cooldown');
   assert.ok(d.waitMs > 0);
 });
+
+// ---- classifyTurn：watcher 决策（原为零覆盖）----
+const cfgAll = resolveConfig({});
+t('classifyTurn: user-cancelled → none', () => {
+  assert.equal(classifyTurn(cfgAll, { status: 'cancelled', cancelled_by_user: 1 }, null).kind, 'none');
+});
+t('classifyTurn: completed → none', () => {
+  assert.equal(classifyTurn(cfgAll, { status: 'completed' }, null).kind, 'none');
+});
+t('classifyTurn: context_exceeded → skip', () => {
+  const d = classifyTurn(cfgAll, { status: 'error', context_exceeded: 1 }, null);
+  assert.equal(d.kind, 'skip');
+  assert.equal(d.reason, 'context_exceeded');
+});
+t('classifyTurn: error without facts → skip (不再盲目续跑)', () => {
+  const d = classifyTurn(cfgAll, { status: 'error' }, null);
+  assert.equal(d.kind, 'skip');
+  assert.equal(d.reason, 'unknowable_error');
+});
+t('classifyTurn: transient error → continue', () => {
+  const d = classifyTurn(cfgAll, { status: 'error' }, { code: 'X', message: 'upstream connection lost', status: undefined });
+  assert.equal(d.kind, 'continue');
+});
+t('classifyTurn: permanent error → skip', () => {
+  const d = classifyTurn(cfgAll, { status: 'error' }, { code: 'X', message: 'Insufficient balance. Please top up your account.', status: undefined });
+  assert.equal(d.kind, 'skip');
+  assert.equal(d.reason, 'permanent');
+});
+t('classifyTurn: classify=false → continue for any error', () => {
+  const d = classifyTurn(resolveConfig({ classify: false }), { status: 'error' }, null);
+  assert.equal(d.kind, 'continue');
+});
+
+// ---- resolveConfig：自定义分类正则透传（原为死配置）----
+t('resolveConfig: permanentPatterns passthrough', () => {
+  const cfg = resolveConfig({ permanentPatterns: ['自定义永久错误'] });
+  assert.deepEqual(cfg.permanentPatterns, ['自定义永久错误']);
+});
+t('resolveConfig: empty permanentPatterns falls back to null', () => {
+  assert.equal(resolveConfig({ permanentPatterns: [] }).permanentPatterns, null);
+});
+t('classifyText: custom permanentPatterns 生效', () => {
+  const cfg = resolveConfig({ permanentPatterns: ['自定义永久错误'] });
+  assert.equal(classifyText('自定义永久错误', cfg), 'permanent');
+});
+t('resolveConfig: injectTimeoutMs floor 5s', () => {
+  assert.equal(resolveConfig({ injectTimeoutMs: 10 }).injectTimeoutMs, 5000);
+});
+
+// ---- UserPromptSubmit hook：命令解析 ----
+t('parseDuration: 单位换算', () => {
+  assert.equal(parseDuration('30s'), 30000);
+  assert.equal(parseDuration('10m'), 600000);
+  assert.equal(parseDuration('2h'), 7200000);
+  assert.equal(parseDuration('5'), 300000); // 无单位视作分钟
+  assert.equal(parseDuration(''), null);
+  assert.ok(Number.isNaN(parseDuration('abc')));
+});
+t('parseCommand: /auto-continue 子命令', () => {
+  assert.deepEqual(parseCommand('/auto-continue pause 10m'), { sub: 'pause', arg: '10m' });
+  assert.equal(parseCommand('/auto-continue').sub, 'status');
+  assert.equal(parseCommand('/auto-continue skip-once').sub, 'skip-once');
+  assert.equal(parseCommand('普通提示词'), null);
+});
+
+console.log(`\nAll ${n} assertions passed.`);

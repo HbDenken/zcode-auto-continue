@@ -8,19 +8,22 @@ ZCode plugin for automatic retry on transient errors — ported from `dsh-auto-c
 - **Error classification**: Automatically retries transient errors (network, timeout, 5xx, 429), skips permanent errors (auth, billing, context overflow)
 - **Adaptive backoff**: Exponential backoff with configurable cap
 - **Truncation recovery**: Detects and retries truncated responses
-- **Empty response recovery**: Catches empty assistant responses
+- **Empty response recovery**: Only when the transcript proves the last assistant turn had neither text nor tool calls (a turn that merely ended after tool calls is *not* treated as empty)
 - **Loop guard**: Prevents infinite retry loops on identical errors
 - **turn.failed coverage**: DB polling catches `turn.failed` (architectural blind spot of pure hook plugins)
+- **Manual control**: `/auto-continue pause [10m] | resume | skip-once`; any real prompt resets the retry counters
 
 ## Architecture
 
 | Component | Path | Role |
 |-----------|------|------|
-| Core logic | `lib/core.mjs` | Config resolution, error classification, backoff, template filling |
+| Core logic | `lib/core.mjs` | Config resolution, error classification, backoff, template filling, transcript inspection |
 | State management | `lib/state.mjs` | Shared state with lost-update merge between hook and watcher |
+| Stats | `lib/stats.mjs` | Daily counters shared by both resume paths |
 | Watcher daemon | `lib/watcher.mjs` | DB-polling fallback, catches turn.failed, deep backoff |
 | Stop hook | `hooks/stop.mjs` | Real-time classification at turn end |
 | SessionStart hook | `hooks/session-start.mjs` | Auto-launches watcher daemon |
+| UserPromptSubmit hook | `hooks/user-prompt-submit.mjs` | Resets counters on real prompts; writes pause/suppress state |
 
 ## Installation
 

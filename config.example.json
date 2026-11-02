@@ -15,5 +15,9 @@
   "bannerMaxLength": 80,
   "minErrorCoverage": 0.2,
   "truncationGuard": true,
-  "minTruncationLength": 300
+  "minTruncationLength": 300,
+  "scanTranscript": true,
+  "injectTimeoutMs": 120000,
+  "permanentPatterns": [],
+  "transientPatterns": []
 }

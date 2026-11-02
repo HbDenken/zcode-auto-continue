@@ -13,8 +13,9 @@
  * 干跑：设 ZCODE_AC_DRY_RUN=1 只记录决策、不真正 block。
  * stdin 字段双兼容（驼峰/下划线），任何异常静默放行，绝不阻塞会话。
  */
-import { classifyText, classifyTruncation, loopGuardHash, fillTemplate, resolveConfig } from '../lib/core.mjs';
+import { classifyText, classifyTruncation, loopGuardHash, fillTemplate, resolveConfig, inspectTranscript } from '../lib/core.mjs';
 import { readState, writeState, sessionEntry, consumeSuppress } from '../lib/state.mjs';
+import { record } from '../lib/stats.mjs';
 import { existsSync, appendFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { STATE_DIR } from '../lib/state.mjs';
@@ -46,8 +47,24 @@ export function normalizeInput(raw) {
     event: String(pick(raw, 'hook_event_name', 'hookEventName') || ''),
     sessionId: String(pick(raw, 'session_id', 'sessionId') || 'unknown'),
     lastMessage: String(pick(raw, 'last_assistant_message', 'lastAssistantMessage', 'responseText', 'responsePreview') ?? ''),
+    transcriptPath: String(pick(raw, 'transcript_path', 'transcriptPath') || ''),
     stopHookActive: Boolean(pick(raw, 'stop_hook_active', 'stopHookActive')),
   };
+}
+
+/**
+ * 判定"无文本"是否该视为真空响应。
+ * 原实现的 bug：`if (!kind && !msg.trim()) kind = 'empty'` —— 只凭 msg 为空就注入，
+ * 导致以工具调用收尾的正常回合被反复注入"上次回复为空"（实测误伤本机审查会话）。
+ * 现在要求 transcript 提供正面证据：最后一条 assistant 条目存在、且既无 text 又无 tool。
+ */
+export function resolveEmptyKind(input, cfg) {
+  if (input.lastMessage.trim()) return null;
+  if (cfg.scanTranscript === false) return null; // 显式关闭取证则不猜，保守放行
+  const t = inspectTranscript(input.transcriptPath);
+  if (!t.decisible) return null;      // 读不到 transcript：保守放行
+  if (t.hasText || t.hasTool) return null; // 有文本或工具调用 → 正常结束
+  return 'empty';
 }
 
 /**
@@ -61,16 +78,20 @@ export function decide({ input, entry, cfg, maxHookRetries, loopGuardRepeats }) 
 
   let kind = classifyText(msg, cfg);
   if (!kind && msg.trim()) kind = classifyTruncation(msg, cfg) ? 'truncation' : null;
-  if (!kind && !msg.trim()) kind = 'empty'; // 空响应：transcript 兜底不可用（文件即清理），按空判定
+  if (!kind) kind = resolveEmptyKind(input, cfg);
 
   if (!kind) return { action: 'pass', kind: 'normal' };
   if (kind === 'permanent') return { action: 'pass', kind, reason: '永久性错误，重试无意义' };
 
   if (entry.consecutive >= maxHookRetries) return { action: 'give-up', kind, reason: `已达续跑上限 ${maxHookRetries}` };
 
+  // 重入防护：stop_hook_active 表示本次停止由我们自己的 block 引发。
+  // 此时同样的"空响应"不应被当作新证据（否则 block→空→block 无限循环），
+  // 强制计入重复，交给 loopGuard 收敛。
   const hash = loopGuardHash(msg);
   const repeats = hash === entry.lastHash ? entry.repeats + 1 : 1;
-  if (repeats > loopGuardRepeats) return { action: 'give-up', kind, reason: '相同错误连续重复，停止重试' };
+  const effectiveRepeats = input.stopHookActive ? Math.max(repeats, entry.repeats + 1) : repeats;
+  if (effectiveRepeats > loopGuardRepeats) return { action: 'give-up', kind, reason: '相同错误连续重复，停止重试' };
 
   // 冷却期：hook 不阻塞，总是放行让 watcher 兜底。
   // watcher 每轮热重载 config + 读 state，能准确计算退避并在冷却结束后注入。
@@ -84,7 +105,7 @@ export function decide({ input, entry, cfg, maxHookRetries, loopGuardRepeats }) 
       ? fillTemplate(cfg.continueText, {}) + '（上次回复为空，请重新给出完整回复）'
       : fillTemplate(cfg.continueText, { facts: { code: '', message: msg.slice(0, 200), status: '' }, errorCount: entry.consecutive + 1 });
 
-  return { action: 'block', kind, text, repeats, hash };
+  return { action: 'block', kind, text, repeats: effectiveRepeats, hash };
 }
 
 async function main() {
@@ -129,6 +150,7 @@ async function main() {
       } else if (d.kind === 'permanent') {
         entry.consecutive = 0; entry.stopped = true;
         writeState(state);
+        record('skipped', d.kind);
         log(`skip ${input.sessionId}: ${d.reason}`);
       }
       return;
@@ -136,6 +158,7 @@ async function main() {
     if (d.action === 'give-up') {
       entry.stopped = true;
       writeState(state);
+      record('gaveUp');
       log(`give-up ${input.sessionId}: ${d.reason}`);
       return;
     }
@@ -155,6 +178,7 @@ async function main() {
     log(`block ${input.sessionId} #${entry.consecutive} kind=${d.kind} "${d.text.slice(0, 80)}"`);
 
     if (DRY) { log(`DRY-RUN: 不输出 block`); return; }
+    record('sent', d.kind);
     process.stdout.write(JSON.stringify({ decision: 'block', reason: d.text }));
   } catch (e) {
     log(`error ${input.sessionId}: ${e?.stack || e}`);
