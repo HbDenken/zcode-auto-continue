@@ -86,6 +86,12 @@ export function decide({ input, entry, cfg, maxHookRetries, loopGuardRepeats }) 
   if (!kind) return { action: 'pass', kind: 'normal' };
   if (kind === 'permanent') return { action: 'pass', kind, reason: '永久性错误，重试无意义' };
 
+  // 已放弃的会话：直接放行。原实现在这里继续往下走 → 每次 Stop 都命中 give-up，
+  // 消费方每次都 record('gaveUp') + 写盘，把统计稀释（stopped 只应计一次）。
+  // kind 用 'stopped' 而非 'normal'：调用方只在 kind==='normal' 时重置计数，
+  // 用 normal 会顺手把 stopped 复位、闸门重开。
+  if (entry.stopped) return { action: 'pass', kind: 'stopped' };
+
   if (entry.consecutive >= maxHookRetries) return { action: 'give-up', kind, reason: `已达续跑上限 ${maxHookRetries}` };
 
   // 重入防护：stop_hook_active 表示本次停止由我们自己的 block 引发。

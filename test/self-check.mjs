@@ -100,6 +100,23 @@ t('permanent: context length exceeded', () => {
     false,
   );
 });
+t('permanent: invalid_model_request（回归：近 30 天 160 次白烧 3 次注入）', () => {
+  // 真实报文（实测取自带内 DB）：message 里没有 "invalid request" 字样，只有 error.type 有，
+  // 所以必须按 code 判定；否则被判临时，每回合白打 3 次 --resume。
+  assert.equal(
+    isTransientFailure({ code: 'invalid_model_request', message: 'Provider rejected the model request.' }),
+    false,
+  );
+  assert.equal(
+    isTransientFailure({
+      code: 'invalid_model_request',
+      message: '[400]: {"error":{"message":"\\"thinking\\" is not supported on /v1/chat/completions and was not applied.","type":"invalid_request_error"}}',
+    }),
+    false,
+  );
+  // code 形如 invalid_model_request_* 也覆盖
+  assert.equal(isTransientFailure({ code: 'invalid_request_error', message: '' }), false);
+});
 t('user patterns override builtin classification', () => {
   // 内置判为永久，但用户声明可重试。
   assert.equal(isTransientFailure({ code: 'auth', message: 'unauthorized' }, 'unauthorized'), true);
@@ -643,6 +660,16 @@ t('state: 水位按 watermarkSetAt 取较新的一份（支持注入失败时回
   writeState(b, path);
   assert.equal(readState(path).watermark, 5000);
   rmSync(dir, { recursive: true, force: true });
+});
+t('decide: 已放弃会话 → pass/stopped（回归：重复 give-up 稀释 gaveUp 统计）', () => {
+  const cfg = resolveConfig({});
+  const entry = sessionEntry(emptyState(), 's');
+  entry.stopped = true;
+  entry.consecutive = 3;
+  const d = decide({ input: { lastMessage: '当前系统繁忙' }, entry, cfg, maxHookRetries: 3, loopGuardRepeats: 3 });
+  assert.equal(d.action, 'pass');
+  // 必须是 'stopped' 而非 'normal'：调用方只在 kind==='normal' 时重置 stopped。
+  assert.equal(d.kind, 'stopped');
 });
 t('state: pruneTo 保留只被 watcher 触达（resetAt 有值）的会话', () => {
   const s = emptyState();
