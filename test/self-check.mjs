@@ -337,7 +337,8 @@ t('state: sessionEntry initializes all fields', () => {
   assert.equal(e.handled.length, 0);
   assert.equal(e.lastHash, '');
   assert.equal(e.repeats, 0);
-  assert.equal(e.hookResumeAt, 0);
+  assert.equal(e.resetAt, 0);
+  assert.deepEqual(e.hookTurnIds, []);
   assert.strictEqual(sessionEntry(s, 'sess-1'), e); // 幂等：同一对象
 });
 t('state: consumeSuppress one-shot', () => {
@@ -349,30 +350,33 @@ t('state: consumeSuppress one-shot', () => {
 });
 t('state: pruneSessions removes old + caps 50', () => {
   const s = emptyState();
-  s.sessions['old'] = { consecutive: 0, lastAttemptAt: 0, hookResumeAt: 0 };
-  s.sessions['recent'] = { consecutive: 1, lastAttemptAt: Date.now(), hookResumeAt: 0 };
+  s.sessions['old'] = { consecutive: 0, lastAttemptAt: 0 };
+  s.sessions['recent'] = { consecutive: 1, lastAttemptAt: Date.now() };
   pruneSessions(s);
   assert.ok(!s.sessions['old']);
   assert.ok(s.sessions['recent']);
 });
 t('state: writeState merges (no lost-update)', () => {
-  const path = `${STATE_DIR}\\state-test-${process.pid}.json`; // append pid to avoid polluting real state
+  // 用临时目录，别碰真实 STATE_DIR（旧版写 STATE_DIR\state-test-*.json，
+  // 断言失败时 unlinkSync 走不到，实测残留了 state-test-10176.json）。
+  const dir = mkdtempSync(join(tmpdir(), 'ac-merge-'));
+  const path = join(dir, 'state.json');
   const now = Date.now();
-  // 磁盘上有 hook 写入的较新 hookResumeAt
+  // 磁盘上是 watcher 写入的较新 lastAttemptAt
   const disk = emptyState();
-  disk.sessions['sess-a'] = { consecutive: 1, lastAttemptAt: now, handled: ['t1'], lastHash: '', repeats: 0, stopped: false, hookResumeAt: now + 111 };
+  disk.sessions['sess-a'] = { consecutive: 1, lastAttemptAt: now + 111, handled: ['t1'], lastHash: '', repeats: 0, stopped: false, hookTurnIds: ['turn-x'] };
   writeState(disk, path);
-  // 内存副本较旧——模拟 watcher 的快照
+  // 内存副本较旧——模拟 hook 的旧快照
   const stale = emptyState();
-  stale.sessions['sess-a'] = { consecutive: 1, lastAttemptAt: now, handled: ['t1'], lastHash: '', repeats: 0, stopped: false, hookResumeAt: now };
-  stale.sessions['sess-b'] = { consecutive: 0, lastAttemptAt: now, handled: ['t2'], lastHash: '', repeats: 0, stopped: false, hookResumeAt: 0 };
-  writeState(stale, path); // 不应覆盖磁盘上的 hookResumeAt (now+111)
+  stale.sessions['sess-a'] = { consecutive: 0, lastAttemptAt: now, handled: ['t1'], lastHash: '', repeats: 0, stopped: false, hookTurnIds: [] };
+  stale.sessions['sess-b'] = { consecutive: 0, lastAttemptAt: now, handled: ['t2'], lastHash: '', repeats: 0, stopped: false, hookTurnIds: [] };
+  writeState(stale, path); // 不应覆盖磁盘上较新的那份
   const merged = readState(path);
-  assert.equal(merged.sessions['sess-a'].hookResumeAt, now + 111); // 磁盘较新，保留
-  assert.equal(merged.sessions['sess-a'].consecutive, 1);
+  assert.equal(merged.sessions['sess-a'].consecutive, 1); // 磁盘较新，保留
   assert.deepEqual(merged.sessions['sess-a'].handled, ['t1']); // 并集
+  assert.deepEqual(merged.sessions['sess-a'].hookTurnIds, ['turn-x']); // 去重表并集
   assert.equal(merged.sessions['sess-b'].handled[0], 't2'); // 内存新增会话
-  unlinkSync(path);
+  rmSync(dir, { recursive: true, force: true });
 });
 t('state: writeState keeps suppress if only disk has it', () => {
   const path = `${STATE_DIR}\\state-test-${process.pid}.json`;
@@ -469,7 +473,10 @@ t('decide: empty message + readable transcript(no text, no tool) → block empty
   assert.equal(d.kind, 'empty');
   unlinkSync(tp);
 });
-t('decide: empty message + transcript shows tool call → pass (regression: 误判空响应)', () => {
+t('decide: empty message + transcript has tool part → pass（防御性分支，ZCode 实际不产出）', () => {
+  // 注：ZCode 的 transcript 只写 {type:"text"}（见 core.mjs inspectTranscript 注释），
+  // 该分支在当前宿主上不可达。此断言仅保证"万一出现 tool part 也不误注入"，
+  // 不代表真实格式。
   const cfg = resolveConfig({});
   const entry = sessionEntry(emptyState(), 's');
   const tp = writeTranscript([{ role: 'assistant', content: [{ type: 'tool', tool: 'Bash' }] }]);
@@ -533,6 +540,11 @@ t('decide: cooldown in-progress → cooldown (no sleep)', () => {
 });
 
 // ---- classifyTurn：watcher 决策（原为零覆盖）----
+t('normalizeInput: 提取 turnId（供 watcher 按 turn 去重）', () => {
+  assert.equal(normalizeInput({ turn_id: 'turn_abc' }).turnId, 'turn_abc');
+  assert.equal(normalizeInput({ turnId: 'turn_def' }).turnId, 'turn_def');
+  assert.equal(normalizeInput({}).turnId, '');
+});
 const cfgAll = resolveConfig({});
 t('classifyTurn: user-cancelled → none', () => {
   assert.equal(classifyTurn(cfgAll, { status: 'cancelled', cancelled_by_user: 1 }, null).kind, 'none');

@@ -8,7 +8,7 @@
  *     做文本分类（watcher 覆盖不到的 completed-but-error 盲区在此拦截，且延迟≈0）；
  *   - turn.failed 路径不触发任何钩子（客户端故障致死），由 watcher 轮询 DB 兜底；
  *   - 两条路径共享 state.json 的 per-session consecutive/lastAttemptAt，
- *     续跑上限与冷却合并计数，互不重复注入（watcher 见 hookResumeAt 去重）。
+ *     续跑上限与冷却合并计数，互不重复注入（watcher 见 hookTurnIds 去重）。
  *
  * 干跑：设 ZCODE_AC_DRY_RUN=1 只记录决策、不真正 block。
  * stdin 字段双兼容（驼峰/下划线），任何异常静默放行，绝不阻塞会话。
@@ -49,6 +49,11 @@ export function normalizeInput(raw) {
     lastMessage: String(pick(raw, 'last_assistant_message', 'lastAssistantMessage', 'responseText', 'responsePreview') ?? ''),
     transcriptPath: String(pick(raw, 'transcript_path', 'transcriptPath') || ''),
     stopHookActive: Boolean(pick(raw, 'stop_hook_active', 'stopHookActive')),
+    // 宿主在 Stop 载荷里带了 turnId（QWo → hookRunner.run 的 turnId）。
+    // watcher 靠它做去重：hookResumeAt 与 completed_at 的时间序是错的——
+    // Stop 钩子在【回合结束之前】执行，hookResumeAt 必然早于 completed_at，
+    // 原条件 hookResumeAt >= completed_at 恒不成立（实测日志该分支 0 次命中）。
+    turnId: String(pick(raw, 'turn_id', 'turnId') || ''),
   };
 }
 
@@ -187,7 +192,10 @@ async function main() {
     // block 续跑：更新共享计数。
     entry.consecutive += 1;
     entry.lastAttemptAt = Date.now();
-    entry.hookResumeAt = Date.now(); // watcher 去重：忽略同会话此刻后的 error 回合
+    // watcher 去重：记下本回合已被 hook 续跑过（按 turnId，见 normalizeInput 注释）。
+    if (input.turnId) {
+      entry.hookTurnIds = [...new Set([...(entry.hookTurnIds || []), input.turnId])].slice(-20);
+    }
     entry.lastHash = d.hash;
     entry.repeats = d.repeats;
     writeState(state);

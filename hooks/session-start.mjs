@@ -8,7 +8,7 @@
  * 的 watcher 进程，然后 hook 立即退出——不阻塞会话启动。
  */
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, openSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -55,12 +55,11 @@ function ensureWatcher() {
   } catch (e) {
     return { status: 'error', message: e?.message || String(e) };
   }
-  // spawn 成功立即同步写入 pid，不依赖 setTimeout 异步写入（防止 hook 进程退出时定时器丢失）。
-  const pid = child.pid;
-  if (pid) {
-    try { writeFileSync(PID_FILE, String(pid)); } catch {}
-  }
-  return { status: 'started', pid };
+  // 不在 hook 侧写 pid 文件：watcher 自己用独占创建（wx）抢锁决定谁是唯一实例。
+  // 原实现在这里无条件写 pid，两个并发 SessionStart 会各自 spawn 一个 watcher
+  // 并互相覆盖 pid，两个 watcher 同时轮询 → 同一回合被注入两次（重复扣费）。
+  // hook 只负责"拉起"，pid 归属由 watcher 自己仲裁。
+  return { status: 'started', pid: child.pid };
 }
 
 async function main() {
