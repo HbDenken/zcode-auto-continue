@@ -32,6 +32,21 @@ function t(name, fn) {
   console.log(`ok ${n} - ${name}`);
 }
 
+/**
+ * 建临时目录，并保证进程退出时清理。
+ * 直接 mkdtempSync + 末尾 rmSync 的写法在断言失败时清不到，实测在 %TEMP% 下
+ * 留下过一堆 ac-inj-* 目录；统一走这里就不会复发。
+ */
+const tmpDirs = [];
+function mkTmp(prefix) {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  tmpDirs.push(dir);
+  return dir;
+}
+process.on('exit', () => {
+  for (const d of tmpDirs) { try { rmSync(d, { recursive: true, force: true }); } catch {} }
+});
+
 /** 写一个临时 transcript JSONL，返回路径（调用方负责 unlinkSync）。 */
 let trSeq = 0;
 function writeTranscript(entries) {
@@ -359,7 +374,7 @@ t('state: pruneSessions removes old + caps 50', () => {
 t('state: writeState merges (no lost-update)', () => {
   // 用临时目录，别碰真实 STATE_DIR（旧版写 STATE_DIR\state-test-*.json，
   // 断言失败时 unlinkSync 走不到，实测残留了 state-test-10176.json）。
-  const dir = mkdtempSync(join(tmpdir(), 'ac-merge-'));
+  const dir = mkTmp('ac-merge-');
   const path = join(dir, 'state.json');
   const now = Date.now();
   // 磁盘上是 watcher 写入的较新 lastAttemptAt
@@ -376,7 +391,6 @@ t('state: writeState merges (no lost-update)', () => {
   assert.deepEqual(merged.sessions['sess-a'].handled, ['t1']); // 并集
   assert.deepEqual(merged.sessions['sess-a'].hookTurnIds, ['turn-x']); // 去重表并集
   assert.equal(merged.sessions['sess-b'].handled[0], 't2'); // 内存新增会话
-  rmSync(dir, { recursive: true, force: true });
 });
 t('state: writeState keeps suppress if only disk has it', () => {
   const path = `${STATE_DIR}\\state-test-${process.pid}.json`;
@@ -627,7 +641,7 @@ t('decide: 冷却窗口按 hookCooldownMs（回归：20s 冷却会静默吞掉�
 
 // ---- 第 3 条：stats 合并写盘（防 lost-update）----
 t('stats: writeStats 合并磁盘，不覆盖并发记账', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'ac-stats-'));
+  const dir = mkTmp('ac-stats-');
   const path = join(dir, 'stats.json');
   // watcher 快照 + 期间 hook 记账（各用显式 path，不碰真实 STATE_DIR）
   const snap = readStats(path);
@@ -641,12 +655,11 @@ t('stats: writeStats 合并磁盘，不覆盖并发记账', () => {
   assert.equal(after.sent, 1);
   assert.equal(after.skipped, 1);
   assert.equal(after.byCode.permanent, 1);
-  rmSync(dir, { recursive: true, force: true });
 });
 
 // ---- 第 6 条：人工重置写 resetAt，合并时不被旧快照吞掉 ----
 t('state: resetAt 让重置在陈旧快照路径下生效（回归：重置被合并吞掉）', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'ac-state-'));
+  const dir = mkTmp('ac-state-');
   const path = join(dir, 'state.json');
   const now = Date.now();
   const fresh = emptyState();
@@ -659,10 +672,9 @@ t('state: resetAt 让重置在陈旧快照路径下生效（回归：重置被�
   se.consecutive = 0; se.lastAttemptAt = now - 5000; se.resetAt = now + 1000;
   writeState(stale, path);
   assert.equal(readState(path).sessions.s1.consecutive, 0);
-  rmSync(dir, { recursive: true, force: true });
 });
 t('state: 水位按 watermarkSetAt 取较新的一份（支持注入失败时回退）', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'ac-wm-'));
+  const dir = mkTmp('ac-wm-');
   const path = join(dir, 'state.json');
   const now = Date.now();
   const a = emptyState(); a.watermark = 5000; a.watermarkSetAt = now;
@@ -671,7 +683,6 @@ t('state: 水位按 watermarkSetAt 取较新的一份（支持注入失败时回
   const b = emptyState(); b.watermark = 9000; b.watermarkSetAt = now - 10000;
   writeState(b, path);
   assert.equal(readState(path).watermark, 5000);
-  rmSync(dir, { recursive: true, force: true });
 });
 t('decide: 已放弃会话 → pass/stopped（回归：重复 give-up 稀释 gaveUp 统计）', () => {
   const cfg = resolveConfig({});
@@ -703,7 +714,7 @@ t('state: consumeInjectMarker 一次性 + 窗口过期 + 墓碑防复活', () =>
   assert.equal(consumeInjectMarker(s2, 's3', 60000), false);
 });
 t('state: 合并时已消费的注入标记不被旧快照复活', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'ac-inj-'));
+  const dir = mkTmp('ac-inj-');
   const path = join(dir, 'state.json');
   const now = Date.now();
   // 磁盘上留着 watcher spawn 前写的未消费标记
@@ -718,7 +729,6 @@ t('state: 合并时已消费的注入标记不被旧快照复活', () => {
   writeState(cur, path);
   const after = readState(path).sessions.s1;
   assert.equal(after.injectAt, 0, '旧快照的 injectAt 不得复活');
-  rmSync(dir, { recursive: true, force: true });
 });
 t('state: pruneTo 保留只被 watcher 触达（resetAt/injectAt 有值）的会话', () => {
   const s = emptyState();
