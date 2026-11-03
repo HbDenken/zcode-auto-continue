@@ -3,6 +3,7 @@
   "continueText": "继续",
   "graceMs": 3000,
   "cooldownMs": 20000,
+  "hookCooldownMs": 3000,
   "maxConsecutive": 3,
   "verbose": true,
   "classify": true,

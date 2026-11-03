@@ -96,11 +96,11 @@ export function decide({ input, entry, cfg, maxHookRetries, loopGuardRepeats }) 
   const effectiveRepeats = input.stopHookActive ? Math.max(repeats, entry.repeats + 1) : repeats;
   if (effectiveRepeats > loopGuardRepeats) return { action: 'give-up', kind, reason: '相同错误连续重复，停止重试' };
 
-  // 冷却期：hook 不阻塞，总是放行让 watcher 兜底。
-  // watcher 每轮热重载 config + 读 state，能准确计算退避并在冷却结束后注入。
-  // Stop hook 阻塞可能被 ZCode 的 hooks.json timeoutMs 杀死，导致 block 丢失。
-  const wait = Math.max(0, (entry.lastAttemptAt || 0) + cfg.cooldownMs - Date.now());
-  if (wait > 0) return { action: 'cooldown', kind, waitMs: wait, reason: '冷却中，让位 watcher' };
+  // 冷却期：hook 处理的回合状态是 completed，watcher 接不住，所以这里不能长冷却，
+  // 否则该回合被静默丢弃（实测 20s 内连续两个悬空回合，第二个直接没了）。
+  // 限速交给引擎的 3 次 block 硬上限 + maxConsecutive + loopGuard。
+  const wait = Math.max(0, (entry.lastAttemptAt || 0) + cfg.hookCooldownMs - Date.now());
+  if (wait > 0) return { action: 'cooldown', kind, waitMs: wait, reason: 'hook 冷却中' };
 
   const text = kind === 'truncation'
     ? fillTemplate(cfg.continueText, {}) + '（上次回复疑似被截断，请接着已输出内容继续，不要重复）'
@@ -152,10 +152,13 @@ async function main() {
     if (d.action === 'pass') {
       if (d.kind === 'normal' && (entry.consecutive > 0 || entry.repeats > 0)) {
         entry.consecutive = 0; entry.repeats = 0; entry.lastHash = ''; entry.stopped = false;
+        entry.failedCount = 0;
+        entry.resetAt = Date.now(); // 让合并判据认得这次重置（否则被 watcher 旧快照覆盖）
         writeState(state);
         log(`reset ${input.sessionId}: 回合正常结束`);
       } else if (d.kind === 'permanent') {
         entry.consecutive = 0; entry.stopped = true;
+        entry.resetAt = Date.now();
         writeState(state);
         record('skipped', d.kind);
         log(`skip ${input.sessionId}: ${d.reason}`);
@@ -170,8 +173,8 @@ async function main() {
       return;
     }
     if (d.action === 'cooldown') {
-      // 退避期间：放行，让 watcher 兜底。hook 不阻塞，避免 ZCode timeoutMs 杀死进程。
-      log(`cooldown ${input.sessionId}: ${Math.round(d.waitMs / 1000)}s → 让位 watcher`);
+      // 极短冷却（默认 3s）：只防同刻重复注入，不再长期放行。
+      log(`cooldown ${input.sessionId}: ${Math.round(d.waitMs / 1000)}s`);
       return;
     }
 

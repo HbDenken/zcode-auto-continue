@@ -122,6 +122,11 @@ async function main() {
       entry.repeats = 0;
       entry.lastHash = '';
       entry.stopped = false;
+      entry.failedCount = 0;
+      // 必须写 resetAt：重置不改 lastAttemptAt，而合并按时间戳取"较新那份"，
+      // 没有这个时间戳时重置会被 watcher 的较新快照整份覆盖回去（实测复现：
+      // 重置后 consecutive 又回到 3）。
+      entry.resetAt = Date.now();
       writeState(state);
       log(`reset ${sessionId}: 人工提交新提示词`);
     }

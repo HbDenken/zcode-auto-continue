@@ -17,7 +17,8 @@ import {
   loopGuardHash,
 } from '../lib/core.mjs';
 import { readState, writeState, sessionEntry, consumeSuppress, emptyState, pruneSessions, STATE_DIR } from '../lib/state.mjs';
-import { writeFileSync, unlinkSync } from 'node:fs';
+import { readStats, writeStats } from '../lib/stats.mjs';
+import { writeFileSync, unlinkSync, rmSync, mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { normalizeInput, decide } from '../hooks/stop.mjs';
@@ -278,6 +279,17 @@ t('classifyDangling: 长回复 → null（正文字数上限）', () => {
 t('classifyDangling: 意图短语不在末句 → null', () => {
   assert.equal(classifyDangling('Let me check. 检查完成，结果是三条记录都匹配。'), null);
 });
+t('classifyDangling: 解释/收尾类意图短语 → null（回归：实测误伤样本）', () => {
+  // 这些"表面是指令、实为解释或收尾"的短回复曾被判成未完成并注入 block。
+  assert.equal(classifyDangling("The build passes. I'll note the caveat in the README."), null);
+  assert.equal(classifyDangling("OK, that's everything. Let's wrap up."), null);
+  assert.equal(classifyDangling('Let me explain the design: we poll the DB every 5 seconds.'), null);
+  assert.equal(classifyDangling('分析完成。我将总结如下。'), null);
+  assert.equal(classifyDangling("I'll mention it in the summary."), null);
+});
+t('classifyDangling: 宣布要列却没列 → dangling（不因冒号误放行）', () => {
+  assert.equal(classifyDangling('Let me verify the following:'), 'dangling');
+});
 t('classifyDangling: guard 关闭 → null', () => {
   assert.equal(classifyDangling('Let me pull the rest.', { danglingGuard: false }), null);
 });
@@ -494,7 +506,8 @@ t('decide: loop guard triggers on repeated error', () => {
   assert.equal(d.action, 'give-up');
 });
 t('decide: cooldown in-progress → cooldown (no sleep)', () => {
-  const cfg = resolveConfig({ cooldownMs: 60000 });
+  // hook 侧冷却用 hookCooldownMs（不再用 watcher 的 cooldownMs，见第 1 条修复）。
+  const cfg = resolveConfig({ hookCooldownMs: 60000 });
   const entry = sessionEntry(emptyState(), 's');
   entry.lastAttemptAt = Date.now() - 10000; // 10s ago, cooldown 60s
   const d = decide({ input: { lastMessage: '系统繁忙' }, entry, cfg, maxHookRetries: 3, loopGuardRepeats: 3 });
@@ -564,6 +577,79 @@ t('parseCommand: /auto-continue 子命令', () => {
   assert.equal(parseCommand('/auto-continue').sub, 'status');
   assert.equal(parseCommand('/auto-continue skip-once').sub, 'skip-once');
   assert.equal(parseCommand('普通提示词'), null);
+});
+
+// ---- 第 1 条：hook 侧冷却用 hookCooldownMs，不用 watcher 的 cooldownMs ----
+t('resolveConfig: hookCooldownMs 默认 3s 且可覆盖', () => {
+  assert.equal(resolveConfig({}).hookCooldownMs, 3000);
+  assert.equal(resolveConfig({ hookCooldownMs: 500 }).hookCooldownMs, 500);
+});
+t('decide: 冷却窗口按 hookCooldownMs（回归：20s 冷却会静默吞掉第二个悬空回合）', () => {
+  const cfg = resolveConfig({});
+  const entry = sessionEntry(emptyState(), 's');
+  // 上次注入在 5 秒前：20s 冷却下会 cooldown（丢弃），3s 冷却下应放行 → block。
+  entry.lastAttemptAt = Date.now() - 5000;
+  const d = decide({
+    input: { lastMessage: 'Found the root cause. Let me pull the remaining regions.' },
+    entry, cfg, maxHookRetries: 3, loopGuardRepeats: 3,
+  });
+  assert.equal(d.action, 'block');
+});
+
+// ---- 第 3 条：stats 合并写盘（防 lost-update）----
+t('stats: writeStats 合并磁盘，不覆盖并发记账', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ac-stats-'));
+  const path = join(dir, 'stats.json');
+  // watcher 快照 + 期间 hook 记账（各用显式 path，不碰真实 STATE_DIR）
+  const snap = readStats(path);
+  snap.sent += 1;
+  const hook = readStats(path);
+  hook.skipped += 1;
+  hook.byCode.permanent = 1;
+  writeStats(hook, path);
+  writeStats(snap, path); // watcher 用陈旧快照覆盖 → hook 的记账必须保住
+  const after = readStats(path);
+  assert.equal(after.sent, 1);
+  assert.equal(after.skipped, 1);
+  assert.equal(after.byCode.permanent, 1);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+// ---- 第 6 条：人工重置写 resetAt，合并时不被旧快照吞掉 ----
+t('state: resetAt 让重置在陈旧快照路径下生效（回归：重置被合并吞掉）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ac-state-'));
+  const path = join(dir, 'state.json');
+  const now = Date.now();
+  const fresh = emptyState();
+  const fe = sessionEntry(fresh, 's1');
+  fe.consecutive = 3; fe.lastAttemptAt = now;
+  writeState(fresh, path);
+  // hook 持有更旧的快照做人工重置（不改 lastAttemptAt，只写 resetAt）
+  const stale = emptyState();
+  const se = sessionEntry(stale, 's1');
+  se.consecutive = 0; se.lastAttemptAt = now - 5000; se.resetAt = now + 1000;
+  writeState(stale, path);
+  assert.equal(readState(path).sessions.s1.consecutive, 0);
+  rmSync(dir, { recursive: true, force: true });
+});
+t('state: 水位按 watermarkSetAt 取较新的一份（支持注入失败时回退）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ac-wm-'));
+  const path = join(dir, 'state.json');
+  const now = Date.now();
+  const a = emptyState(); a.watermark = 5000; a.watermarkSetAt = now;
+  writeState(a, path);
+  // 较旧的快照带着一个更大的水位 + 更早的时间戳 → 不应覆盖（否则回退被抹掉）
+  const b = emptyState(); b.watermark = 9000; b.watermarkSetAt = now - 10000;
+  writeState(b, path);
+  assert.equal(readState(path).watermark, 5000);
+  rmSync(dir, { recursive: true, force: true });
+});
+t('state: pruneTo 保留只被 watcher 触达（resetAt 有值）的会话', () => {
+  const s = emptyState();
+  const e = sessionEntry(s, 'sess_watcher_only');
+  e.resetAt = Date.now(); // 旧判据下 activeAt=0 会被裁掉
+  pruneSessions(s);
+  assert.ok(s.sessions['sess_watcher_only']);
 });
 
 console.log(`\nAll ${n} assertions passed.`);
