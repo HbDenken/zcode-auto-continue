@@ -16,7 +16,7 @@ import {
   classifyDangling,
   loopGuardHash,
 } from '../lib/core.mjs';
-import { readState, writeState, sessionEntry, consumeSuppress, emptyState, pruneSessions, STATE_DIR } from '../lib/state.mjs';
+import { readState, writeState, sessionEntry, consumeSuppress, consumeInjectMarker, emptyState, pruneSessions, STATE_DIR } from '../lib/state.mjs';
 import { readStats, writeStats } from '../lib/stats.mjs';
 import { writeFileSync, unlinkSync, rmSync, mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
@@ -671,12 +671,54 @@ t('decide: 已放弃会话 → pass/stopped（回归：重复 give-up 稀释 gav
   // 必须是 'stopped' 而非 'normal'：调用方只在 kind==='normal' 时重置 stopped。
   assert.equal(d.kind, 'stopped');
 });
-t('state: pruneTo 保留只被 watcher 触达（resetAt 有值）的会话', () => {
+t('state: consumeInjectMarker 一次性 + 窗口过期 + 墓碑防复活', () => {
+  const s = emptyState();
+  const e = sessionEntry(s, 's1');
+  const now = Date.now();
+  // 窗口内 → 消费成功
+  e.injectAt = now;
+  assert.equal(consumeInjectMarker(s, 's1', 60000), true);
+  assert.equal(e.injectAt, 0);
+  assert.ok(e.injectConsumedAt > 0);
+  // 已消费 → 再消费失败（真人输入不会被误判成注入）
+  assert.equal(consumeInjectMarker(s, 's1', 60000), false);
+  // 超出窗口 → 不消费（陈旧标记不能误伤真人输入）
+  const s2 = emptyState();
+  const e2 = sessionEntry(s2, 's2');
+  e2.injectAt = now - 999999;
+  assert.equal(consumeInjectMarker(s2, 's2', 60000), false);
+  // 无标记 → 不消费
+  assert.equal(consumeInjectMarker(s2, 's3', 60000), false);
+});
+t('state: 合并时已消费的注入标记不被旧快照复活', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ac-inj-'));
+  const path = join(dir, 'state.json');
+  const now = Date.now();
+  // 磁盘上留着 watcher spawn 前写的未消费标记
+  const disk = emptyState();
+  const de = sessionEntry(disk, 's1');
+  de.injectAt = now; de.consecutive = 1;
+  writeState(disk, path);
+  // 注入失败后 watcher 就地清标记（写墓碑）
+  const cur = readState(path);
+  const ce = sessionEntry(cur, 's1');
+  ce.injectAt = 0; ce.injectConsumedAt = now + 1000;
+  writeState(cur, path);
+  const after = readState(path).sessions.s1;
+  assert.equal(after.injectAt, 0, '旧快照的 injectAt 不得复活');
+  rmSync(dir, { recursive: true, force: true });
+});
+t('state: pruneTo 保留只被 watcher 触达（resetAt/injectAt 有值）的会话', () => {
   const s = emptyState();
   const e = sessionEntry(s, 'sess_watcher_only');
   e.resetAt = Date.now(); // 旧判据下 activeAt=0 会被裁掉
+  const s2 = emptyState();
+  const e2 = sessionEntry(s2, 'sess_pending_inject');
+  e2.injectAt = Date.now(); // 待消费的注入标记被裁掉 → UPS 钩子读不到 → 误判真人输入
   pruneSessions(s);
+  pruneSessions(s2);
   assert.ok(s.sessions['sess_watcher_only']);
+  assert.ok(s2.sessions['sess_pending_inject']);
 });
 
 console.log(`\nAll ${n} assertions passed.`);

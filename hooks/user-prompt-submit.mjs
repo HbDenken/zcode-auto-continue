@@ -16,7 +16,8 @@
  * 除上述命令外，任何真实用户输入都会重置该会话的连续计数。
  * 任何异常静默放行，绝不阻塞用户输入。
  */
-import { readState, writeState, sessionEntry, STATE_DIR } from '../lib/state.mjs';
+import { readState, writeState, sessionEntry, consumeInjectMarker, STATE_DIR } from '../lib/state.mjs';
+import { resolveConfig } from '../lib/core.mjs';
 import { existsSync, appendFileSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -24,6 +25,13 @@ const CONFIG_PATH = process.env.ZCODE_AC_CONFIG || join(STATE_DIR, 'config.json'
 
 function log(msg) {
   try { appendFileSync(join(STATE_DIR, 'watcher.log'), `[${new Date().toISOString()}] [prompt] ${msg}\n`); } catch {}
+}
+
+function loadConfig() {
+  try {
+    if (existsSync(CONFIG_PATH)) return resolveConfig(JSON.parse(readFileSync(CONFIG_PATH, 'utf8')));
+  } catch {}
+  return resolveConfig({});
 }
 
 function pick(obj, ...keys) {
@@ -115,6 +123,16 @@ async function main() {
     }
 
     // 人工介入：重置该会话的续跑计数与循环守卫（对齐参考实现的语义）。
+    // 但必须排除"自己注入的续跑"：--resume --prompt 会触发 UserPromptSubmit，
+    // 不排除的话自动续跑每轮都把自己的 consecutive 清零，maxConsecutive 上限失效。
+    // 判别依据是 watcher spawn 前写下的 injectAt 标记（见 consumeInjectMarker 注释）。
+    const cfg = loadConfig();
+    if (consumeInjectMarker(state, sessionId, cfg.injectMarkerMs)) {
+      writeState(state);
+      log(`skip reset ${sessionId}: 本会话的自动续跑注入（consecutive 保持 ${state.sessions[sessionId]?.consecutive ?? 0}）`);
+      return;
+    }
+
     const existing = state.sessions[sessionId];
     if (existing && (existing.consecutive > 0 || existing.repeats > 0 || existing.stopped || existing.lastHash)) {
       const entry = sessionEntry(state, sessionId);

@@ -21,6 +21,7 @@
   "danglingMaxLength": 200,
   "scanTranscript": true,
   "injectTimeoutMs": 120000,
+  "injectMarkerMs": 60000,
   "permanentPatterns": [],
   "transientPatterns": []
 }
