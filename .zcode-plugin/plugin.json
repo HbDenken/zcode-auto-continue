@@ -1,6 +1,6 @@
 {
   "name": "zcode-auto-continue",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "中断后自动续跑（移植自 dsh-auto-continue）。守护进程轮询会话数据库，检测到非人为中断的失败回合后，经 zcode --resume 自动注入续跑消息，并按错误分类与自适应退避决定是否续跑。",
   "author": { "name": "auto-continue-port" },
   "license": "MIT",
