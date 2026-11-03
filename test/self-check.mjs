@@ -13,6 +13,7 @@ import {
   emptyDayStats,
   classifyText,
   classifyTruncation,
+  classifyDangling,
   loopGuardHash,
 } from '../lib/core.mjs';
 import { readState, writeState, sessionEntry, consumeSuppress, emptyState, pruneSessions, STATE_DIR } from '../lib/state.mjs';
@@ -253,6 +254,34 @@ t('classifyTruncation: closing 】 not flagged (regression: was误判 before fix
   assert.equal(classifyTruncation('x'.repeat(300) + '详见文档【附录A】'), null);
 });
 
+// ---- classifyDangling ----
+t('classifyDangling: 实测样本（宣布下一步后结束）→ dangling', () => {
+  assert.equal(
+    classifyDangling('Found the root cause. Let me pull the remaining regions precisely.'),
+    'dangling',
+  );
+  assert.equal(classifyDangling('Now I have the shape of the change. Let me dump the exact regions.'), 'dangling');
+  assert.equal(classifyDangling('让我先把剩下的代码段取出来。'), 'dangling');
+});
+t('classifyDangling: 正常收尾 → null', () => {
+  assert.equal(classifyDangling('任务已完成，代码已提交。'), null);
+  assert.equal(classifyDangling('已修复：Stop hook 现在会识别悬空意图。'), null);
+});
+t('classifyDangling: 征询/收尾句式 → null（不误伤）', () => {
+  assert.equal(classifyDangling('Let me know if you need anything else.'), null);
+  assert.equal(classifyDangling('I will be here if you have questions.'), null);
+  assert.equal(classifyDangling('如需继续，请告诉我。'), null);
+});
+t('classifyDangling: 长回复 → null（正文字数上限）', () => {
+  assert.equal(classifyDangling('x'.repeat(200) + ' Let me continue.'), null);
+});
+t('classifyDangling: 意图短语不在末句 → null', () => {
+  assert.equal(classifyDangling('Let me check. 检查完成，结果是三条记录都匹配。'), null);
+});
+t('classifyDangling: guard 关闭 → null', () => {
+  assert.equal(classifyDangling('Let me pull the rest.', { danglingGuard: false }), null);
+});
+
 // ---- loopGuardHash ----
 t('loopGuardHash: deterministic + length capped', () => {
   const h = loopGuardHash('error text');
@@ -373,6 +402,34 @@ t('decide: truncation → block with truncation text', () => {
   const d = decide({ input: { lastMessage: 'x'.repeat(300) + '\n```js\nconst x' }, entry, cfg, maxHookRetries: 3, loopGuardRepeats: 3 });
   assert.equal(d.action, 'block');
   assert.equal(d.kind, 'truncation');
+});
+t('decide: 悬空意图（只说 Let me… 就结束）→ block 并要求给出结果', () => {
+  const cfg = resolveConfig({});
+  const entry = sessionEntry(emptyState(), 's');
+  const d = decide({
+    input: { lastMessage: 'Found the root cause. Let me pull the remaining regions precisely.' },
+    entry, cfg, maxHookRetries: 3, loopGuardRepeats: 3,
+  });
+  assert.equal(d.action, 'block');
+  assert.equal(d.kind, 'dangling');
+  assert.match(d.text, /给出结果|结果/);
+});
+t('decide: 悬空意图不受截断长度门槛影响（短回复也能救）', () => {
+  const cfg = resolveConfig({});
+  const entry = sessionEntry(emptyState(), 's');
+  const d = decide({
+    input: { lastMessage: '让我确认一下依赖版本。' },
+    entry, cfg, maxHookRetries: 3, loopGuardRepeats: 3,
+  });
+  assert.equal(d.action, 'block');
+  assert.equal(d.kind, 'dangling');
+});
+t('decide: 正常结束语 → pass（悬空判定不误伤）', () => {
+  const cfg = resolveConfig({});
+  const entry = sessionEntry(emptyState(), 's');
+  const d = decide({ input: { lastMessage: 'Let me know if you want me to continue.' }, entry, cfg, maxHookRetries: 3, loopGuardRepeats: 3 });
+  assert.equal(d.action, 'pass');
+  assert.equal(d.kind, 'normal');
 });
 t('decide: empty message + readable transcript(no text, no tool) → block empty', () => {
   const cfg = resolveConfig({});

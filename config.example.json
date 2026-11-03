@@ -16,6 +16,8 @@
   "minErrorCoverage": 0.2,
   "truncationGuard": true,
   "minTruncationLength": 300,
+  "danglingGuard": true,
+  "danglingMaxLength": 200,
   "scanTranscript": true,
   "injectTimeoutMs": 120000,
   "permanentPatterns": [],

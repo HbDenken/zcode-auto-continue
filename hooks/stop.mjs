@@ -13,7 +13,7 @@
  * 干跑：设 ZCODE_AC_DRY_RUN=1 只记录决策、不真正 block。
  * stdin 字段双兼容（驼峰/下划线），任何异常静默放行，绝不阻塞会话。
  */
-import { classifyText, classifyTruncation, loopGuardHash, fillTemplate, resolveConfig, inspectTranscript } from '../lib/core.mjs';
+import { classifyText, classifyTruncation, classifyDangling, loopGuardHash, fillTemplate, resolveConfig, inspectTranscript } from '../lib/core.mjs';
 import { readState, writeState, sessionEntry, consumeSuppress } from '../lib/state.mjs';
 import { record } from '../lib/stats.mjs';
 import { existsSync, appendFileSync, readFileSync } from 'node:fs';
@@ -78,6 +78,9 @@ export function decide({ input, entry, cfg, maxHookRetries, loopGuardRepeats }) 
 
   let kind = classifyText(msg, cfg);
   if (!kind && msg.trim()) kind = classifyTruncation(msg, cfg) ? 'truncation' : null;
+  // 悬空意图：回合只宣布了下一步却结束（completed + 最后一步无工具调用），
+  // 既无错误也无截断，前面几类全部放行。判为未完成，要求直接给出结果。
+  if (!kind) kind = classifyDangling(msg, cfg);
   if (!kind) kind = resolveEmptyKind(input, cfg);
 
   if (!kind) return { action: 'pass', kind: 'normal' };
@@ -103,7 +106,11 @@ export function decide({ input, entry, cfg, maxHookRetries, loopGuardRepeats }) 
     ? fillTemplate(cfg.continueText, {}) + '（上次回复疑似被截断，请接着已输出内容继续，不要重复）'
     : kind === 'empty'
       ? fillTemplate(cfg.continueText, {}) + '（上次回复为空，请重新给出完整回复）'
-      : fillTemplate(cfg.continueText, { facts: { code: '', message: msg.slice(0, 200), status: '' }, errorCount: entry.consecutive + 1 });
+      : kind === 'dangling'
+        // 悬空意图：模型只说"让我…"就结束了，用户没拿到结果。
+        // 明确要求直接给出结果，而不是又描述一遍下一步计划。
+        ? fillTemplate(cfg.continueText, {}) + '（上一轮只说了将要做什么就结束了，没有给出结果。请直接完成并给出结论/结果，不要再只描述下一步计划）'
+        : fillTemplate(cfg.continueText, { facts: { code: '', message: msg.slice(0, 200), status: '' }, errorCount: entry.consecutive + 1 });
 
   return { action: 'block', kind, text, repeats: effectiveRepeats, hash };
 }
