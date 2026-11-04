@@ -23,7 +23,9 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { normalizeInput, decide } from '../hooks/stop.mjs';
 import { parseDuration, parseCommand } from '../hooks/user-prompt-submit.mjs';
-import { classifyTurn } from '../lib/watcher.mjs';
+import { classifyTurn, fetchLastErrorFacts } from '../lib/watcher.mjs';
+import { DatabaseSync } from 'node:sqlite';
+import { buildFixture } from './make-fixture.mjs';
 
 let n = 0;
 function t(name, fn) {
@@ -741,6 +743,85 @@ t('state: pruneTo 保留只被 watcher 触达（resetAt/injectAt 有值）的会
   pruneSessions(s2);
   assert.ok(s.sessions['sess_watcher_only']);
   assert.ok(s2.sessions['sess_pending_inject']);
+});
+
+// ---- 回归：三处已在真实数据上定位的缺陷 ----
+// 1) fetchLastErrorFacts 的关联键（窗口被宿主注入的 role=user 行截断）
+// 2) 注入失败后 handled 被 merge 并集复活 → 重试路径失效
+// 3) skip/give-up 分支不写时间戳 → 条目在同一次写盘被 prune 掉
+t('watcher: fetchLastErrorFacts 用 anchor.turnId 命中窗口外的 error（回归：窗口被注入行截断）', () => {
+  const dir = mkTmp('ac-facts-');
+  const dbPath = join(dir, 'fixture.sqlite');
+  buildFixture(dbPath);
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    const turn = db.prepare(`SELECT * FROM turn_usage WHERE session_id = 'sess_w1'`).get();
+    const facts = fetchLastErrorFacts(db, turn);
+    assert.ok(facts, 'anchor 法必须取到 facts（窗口法在此结构下返回 null）');
+    assert.equal(facts.code, 'STREAM');
+    assert.equal(facts.message, 'upstream connection lost');
+    // 窗口法（兜底路径的原始逻辑）在同一结构下确实取不到 —— 证明该 fixture 有效复现了缺陷
+    const startSeq = db.prepare(`SELECT sequence FROM message WHERE id = ?`).get(turn.user_message_id).sequence;
+    const nextUser = db.prepare(
+      `SELECT sequence FROM message WHERE session_id = ? AND sequence > ? AND json_extract(data,'$.role')='user' ORDER BY sequence ASC LIMIT 1`
+    ).get(turn.session_id, startSeq);
+    const endSeq = nextUser ? nextUser.sequence : Number.MAX_SAFE_INTEGER;
+    const rows = db.prepare(
+      `SELECT data FROM message WHERE session_id = ? AND sequence >= ? AND sequence < ? ORDER BY sequence DESC LIMIT 20`
+    ).all(turn.session_id, startSeq, endSeq);
+    assert.equal(extractErrorFacts(rows.map((r) => r.data)), null, '窗口法应取不到（复现截断）');
+  } finally {
+    db.close();
+  }
+});
+t('watcher: fetchLastErrorFacts 在无 anchor 的旧库上回退窗口法', () => {
+  const dir = mkTmp('ac-facts-legacy-');
+  const dbPath = join(dir, 'fixture.sqlite');
+  buildFixture(dbPath);
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    const turn = db.prepare(`SELECT * FROM turn_usage WHERE session_id = 'sess_t1'`).get();
+    const facts = fetchLastErrorFacts(db, turn);
+    assert.ok(facts, '旧库（无 anchor）也要能取到 facts');
+    assert.equal(facts.code, 'STREAM');
+  } finally {
+    db.close();
+  }
+});
+t('state: handled 并集不会复活"注入失败时摘掉"的 turn（回归：重试路径是死的）', () => {
+  const dir = mkTmp('ac-retry-');
+  const path = join(dir, 'state.json');
+  // 修改后 spawn 前不再写 handled，故磁盘上本就没有该 turn
+  const disk = emptyState();
+  const de = sessionEntry(disk, 's1');
+  de.consecutive = 1; de.lastAttemptAt = Date.now(); de.injectAt = Date.now();
+  writeState(disk, path);
+  assert.deepEqual(readState(path).sessions.s1.handled, [], 'spawn 前不应写入 handled');
+  // 失败分支：摘掉（本就没有）+ 记 failedCount
+  const cur = readState(path);
+  const ce = sessionEntry(cur, 's1');
+  ce.failedCount = 1; ce.consecutive = 0; ce.resetAt = Date.now();
+  writeState(cur, path);
+  const after = readState(path).sessions.s1;
+  assert.equal(after.handled.includes('turn_X'), false, 'turn 不得留在 handled 里（否则永不重试）');
+  assert.equal(after.failedCount, 1, 'failedCount 需存活，否则重试上限失效');
+});
+t('state: skip/give-up 写入的 resetAt 让条目在同一次写盘存活（回归：条目被 prune 掉）', () => {
+  const s = emptyState();
+  // 模拟 watcher skip 分支：只改 consecutive/handled 并写 resetAt
+  const e = sessionEntry(s, 'sess_skip');
+  e.consecutive = 0; e.handled.push('turn_skip'); e.resetAt = Date.now();
+  // 模拟 give-up 分支：stopped + resetAt
+  const g = sessionEntry(s, 'sess_stop');
+  g.stopped = true; g.handled.push('turn_stop'); g.resetAt = Date.now();
+  pruneSessions(s);
+  assert.ok(s.sessions['sess_skip'], 'skip 条目不得被裁掉（否则统计翻倍）');
+  assert.equal(s.sessions['sess_stop'].stopped, true, 'stopped 闸门不得被裁掉（否则重开）');
+  // 反向对照：没有任何时间戳的条目仍应被裁掉（保持 prune 语义）
+  const s2 = emptyState();
+  sessionEntry(s2, 'sess_none').handled.push('turn_x');
+  pruneSessions(s2);
+  assert.equal(s2.sessions['sess_none'], undefined, '无时间戳的条目仍应被裁剪');
 });
 
 console.log(`\nAll ${n} assertions passed.`);

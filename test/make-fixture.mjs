@@ -10,6 +10,8 @@
  *   sess_c1  用户取消（cancelled_by_user=1）            → 不处理
  *   sess_d1  已删除会话的瞬时错误                       → SQL 层过滤，不出现
  *   sess_s1  subagent_child 的瞬时错误                  → SQL 层过滤，不出现
+ *   sess_w1  瞬时错误，但回合内夹着宿主注入的 role=user 行（todo_reminder）
+ *            → 只带 anchor.turnId，复现"窗口被提前关掉"的回归点
  *
  * 用法：node test/make-fixture.mjs [输出路径]
  * 默认输出到 ./tmp/fixture.sqlite，并打印路径供 ZCODE_DB 使用。
@@ -40,14 +42,23 @@ CREATE TABLE turn_usage (
 );
 `;
 
-function assistantWithError(id, sessionId, seq, message, code) {
+/** 带 error 的 assistant 消息。传 turnId 则带上 anchor.turnId（真实 ZCode 行为）。 */
+function assistantWithError(id, sessionId, seq, message, code, turnId) {
   return {
     id, sessionId, seq,
-    data: JSON.stringify({ role: 'assistant', error: { name: 'AiSdkModelAdapterError', data: { message, code } } }),
+    data: JSON.stringify({
+      role: 'assistant',
+      error: { name: 'AiSdkModelAdapterError', data: { message, code } },
+      ...(turnId ? { anchor: { turnId } } : {}),
+    }),
   };
 }
 function userRow(id, sessionId, seq) {
   return { id, sessionId, seq, data: JSON.stringify({ role: 'user' }) };
+}
+/** 宿主自己注入的 role=user 行（会截断窗口法），kind 取实测量值。 */
+function injectedUserRow(id, sessionId, seq, kind) {
+  return { id, sessionId, seq, data: JSON.stringify({ role: 'user', semantics: { origin: 'agent_runtime', kind } }) };
 }
 
 export function buildFixture(outPath) {
@@ -86,6 +97,23 @@ export function buildFixture(outPath) {
     insTurn.run(c.sid, `turn_${c.sid}`, `um_${c.sid}`, c.status, now - 5000, now - 3000, c.cancelled, 0, 'unknown_error', c.code);
   }
 
+  // sess_w1：复现"窗口法被宿主注入的 role=user 行截断"，只有 anchor.turnId 能救回。
+  // 结构：user(seq1) → assistant 工具调用(seq2) → injected todo_reminder(seq3) → error(seq4)
+  // 窗口法在 seq3 处闭合，取不到 seq4 的 error；anchor 法直接命中 seq4。
+  {
+    const sid = 'sess_w1';
+    const turnId = `turn_${sid}`;
+    insSession.run(sid, 'proj_test', sid, 'K:\\test', sid, '0.17.1', 'interactive', JSON.stringify({ mode: 'yolo' }), null);
+    insMsg.run(`um_${sid}`, sid, now - 4000, now - 4000, userRow('', '', 0).data, 1);
+    const tool = { id: `am_tool_${sid}`, sessionId: sid, seq: 2, data: JSON.stringify({ role: 'assistant', finish: 'tool-calls', anchor: { turnId } }) };
+    insMsg.run(tool.id, sid, now - 3000, now - 3000, tool.data, 2);
+    const injected = injectedUserRow(`inj_${sid}`, sid, 3, 'todo_reminder');
+    insMsg.run(injected.id, sid, now - 2500, now - 2500, injected.data, 3);
+    const a = assistantWithError(`am_${sid}`, sid, 4, 'upstream connection lost', 'STREAM', turnId);
+    insMsg.run(a.id, sid, now - 1000, now - 1000, a.data, 4);
+    insTurn.run(sid, turnId, `um_${sid}`, 'error', now - 5000, now - 3000, 0, 0, 'unknown_error', 'STREAM');
+  }
+
   db.close();
   return outPath;
 }
@@ -96,5 +124,5 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   console.log(`fixture written: ${out}`);
   console.log('用法：');
   console.log(`  ZCODE_DB="${out}" ZCODE_AC_STATE=<空目录> ZCODE_AC_DRY_RUN=1 node lib/watcher.mjs`);
-  console.log('预期：sess_t1/sess_t2 注入；sess_p1 跳过(permanent)；sess_c1 不处理；sess_d1/sess_s1 不出现。');
+  console.log('预期：sess_t1/sess_t2/sess_w1 注入；sess_p1 跳过(permanent)；sess_c1 不处理；sess_d1/sess_s1 不出现。');
 }
