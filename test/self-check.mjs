@@ -23,7 +23,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { normalizeInput, decide } from '../hooks/stop.mjs';
 import { parseDuration, parseCommand } from '../hooks/user-prompt-submit.mjs';
-import { classifyTurn, fetchLastErrorFacts, resolveZcodeBin, maxSequence, reconcileInjection } from '../lib/watcher.mjs';
+import { classifyTurn, fetchLastErrorFacts, resolveZcodeBin, maxSequence, reconcileInjection, reconcileAction } from '../lib/watcher.mjs';
 import { DatabaseSync } from 'node:sqlite';
 import { buildFixture } from './make-fixture.mjs';
 
@@ -940,6 +940,43 @@ t('state: indeterminate 按 indeterminateAt 取较新，清除后不被旧快照
   se.indeterminateAt = now + 1000; // 清除时刻更晚
   writeState(stale, path);
   assert.equal(readState(path).sessions.s1.indeterminate, null, '已对账清除的标记不得被旧快照复活');
+});
+
+// ---- reconcileAction：对账状态机穷举（原 unknown/abandon/drop 三条路径零覆盖）----
+t('reconcileAction: 同回合 + 已送达 → delivered（不重试）', () => {
+  assert.equal(reconcileAction('delivered', true, false), 'delivered');
+  // 即使已过期，只要查到了结论就按结论走（不能因超时丢掉已知的"已送达"）
+  assert.equal(reconcileAction('delivered', true, true), 'delivered');
+});
+t('reconcileAction: 同回合 + 未送达 → retry', () => {
+  assert.equal(reconcileAction('not-delivered', true, false), 'retry');
+  assert.equal(reconcileAction('not-delivered', true, true), 'retry');
+});
+t('reconcileAction: 同回合 + 读不到 → 未过期 pending / 过期 abandon', () => {
+  assert.equal(reconcileAction('unknown', true, false), 'pending');
+  assert.equal(reconcileAction('unknown', true, true), 'abandon');
+  // preSeq 为 null 时对账同样返回 unknown，走同一条待定路径
+  assert.equal(reconcileAction('unknown', true, false), 'pending');
+});
+t('reconcileAction: 记录属于别的回合 → 未过期 keep / 过期 drop（都不得动水位）', () => {
+  assert.equal(reconcileAction(null, false, false), 'keep');
+  assert.equal(reconcileAction(null, false, true), 'drop');
+  // 别的回合时即便 outcome 有值也不得据它推进当前回合
+  assert.equal(reconcileAction('delivered', false, false), 'keep');
+  assert.equal(reconcileAction('delivered', false, true), 'drop');
+});
+t('reconcileAction: 返回值必须都在已知动作集合内（穷举全部组合）', () => {
+  const allowed = new Set(['delivered', 'retry', 'pending', 'abandon', 'drop', 'keep']);
+  for (const outcome of ['delivered', 'not-delivered', 'unknown', null]) {
+    for (const sameTurn of [true, false]) {
+      for (const expired of [true, false]) {
+        const a = reconcileAction(outcome, sameTurn, expired);
+        assert.ok(allowed.has(a), `未知动作 ${a} @ ${outcome}/${sameTurn}/${expired}`);
+        // 关键不变量：只有"确认未送达"才允许重试；"读不到"绝不能变成重试
+        if (a === 'retry') assert.equal(outcome, 'not-delivered');
+      }
+    }
+  }
 });
 
 console.log(`\nAll ${n} assertions passed.`);
