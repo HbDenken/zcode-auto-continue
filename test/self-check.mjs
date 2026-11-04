@@ -23,7 +23,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { normalizeInput, decide } from '../hooks/stop.mjs';
 import { parseDuration, parseCommand } from '../hooks/user-prompt-submit.mjs';
-import { classifyTurn, fetchLastErrorFacts, resolveZcodeBin } from '../lib/watcher.mjs';
+import { classifyTurn, fetchLastErrorFacts, resolveZcodeBin, maxSequence, reconcileInjection } from '../lib/watcher.mjs';
 import { DatabaseSync } from 'node:sqlite';
 import { buildFixture } from './make-fixture.mjs';
 
@@ -849,6 +849,97 @@ t('state: skip/give-up 写入的 resetAt 让条目在同一次写盘存活（回
   sessionEntry(s2, 'sess_none').handled.push('turn_x');
   pruneSessions(s2);
   assert.equal(s2.sessions['sess_none'], undefined, '无时间戳的条目仍应被裁剪');
+});
+
+// ---- 注入对账：超时(结果未知)时用权威 DB 判定已送达/未送达 ----
+// 这组断言守住"不重复注入"的核心承诺：只有确认未送达才允许重试。
+t('reconcileInjection: 无更新的 CLI 消息 → not-delivered（可以重试）', () => {
+  const dir = mkTmp('ac-rec-');
+  const dbPath = join(dir, 'fixture.sqlite');
+  buildFixture(dbPath);
+  const db = new DatabaseSync(dbPath);
+  try {
+    const pre = maxSequence(db, 'sess_t1');
+    assert.equal(pre, 2, 'fixture 里 sess_t1 的最大 sequence 应为 2');
+    assert.equal(reconcileInjection(db, 'sess_t1', pre), 'not-delivered');
+  } finally { db.close(); }
+});
+t('reconcileInjection: 出现更新的 CLI 注入消息 → delivered（不得重试）', () => {
+  const dir = mkTmp('ac-rec2-');
+  const dbPath = join(dir, 'fixture.sqlite');
+  buildFixture(dbPath);
+  const db = new DatabaseSync(dbPath);
+  try {
+    const pre = maxSequence(db, 'sess_t1');
+    // 模拟 CLI 受理后落库（真实语义：metadata.inputIntent.clientId === 'cli'）
+    db.prepare('INSERT INTO message (id,session_id,time_created,time_updated,data,sequence) VALUES (?,?,?,?,?,?)')
+      .run('inj_x', 'sess_t1', Date.now(), Date.now(),
+        JSON.stringify({ role: 'user', metadata: { inputIntent: { clientId: 'cli' } } }), pre + 1);
+    assert.equal(reconcileInjection(db, 'sess_t1', pre), 'delivered');
+  } finally { db.close(); }
+});
+t('reconcileInjection: 真人输入不算"已送达"（回归：不得把用户打字误判成我们的注入）', () => {
+  const dir = mkTmp('ac-rec3-');
+  const dbPath = join(dir, 'fixture.sqlite');
+  buildFixture(dbPath);
+  const db = new DatabaseSync(dbPath);
+  try {
+    const pre = maxSequence(db, 'sess_t1');
+    // 真人输入：clientId 是 client-<uuid>，与 cli 不同
+    db.prepare('INSERT INTO message (id,session_id,time_created,time_updated,data,sequence) VALUES (?,?,?,?,?,?)')
+      .run('human_x', 'sess_t1', Date.now(), Date.now(),
+        JSON.stringify({ role: 'user', metadata: { inputIntent: { clientId: 'client-01a19ee6' } } }), pre + 1);
+    assert.equal(reconcileInjection(db, 'sess_t1', pre), 'not-delivered');
+  } finally { db.close(); }
+});
+t('reconcileInjection: 早于水位的 CLI 消息不算"本次已送达"（回归：sequence 水位消除歧义）', () => {
+  const dir = mkTmp('ac-rec4-');
+  const dbPath = join(dir, 'fixture.sqlite');
+  buildFixture(dbPath);
+  const db = new DatabaseSync(dbPath);
+  try {
+    // 先把一条 cli 消息放在中立位置，再以它为水位基准
+    db.prepare('INSERT INTO message (id,session_id,time_created,time_updated,data,sequence) VALUES (?,?,?,?,?,?)')
+      .run('old_inj', 'sess_t1', Date.now(), Date.now(),
+        JSON.stringify({ role: 'user', metadata: { inputIntent: { clientId: 'cli' } } }), 10);
+    const pre = maxSequence(db, 'sess_t1'); // = 10
+    // 该消息 sequence 不大于水位 → 属于"上一次"的注入，不能当作本次已送达
+    assert.equal(reconcileInjection(db, 'sess_t1', pre), 'not-delivered');
+    // 而若把水位设在它之前，则应判定为已送达
+    assert.equal(reconcileInjection(db, 'sess_t1', 9), 'delivered');
+  } finally { db.close(); }
+});
+t('maxSequence: 空会话返回 -1，异常返回 null（不能当 -1 用）', () => {
+  const dir = mkTmp('ac-rec5-');
+  const dbPath = join(dir, 'fixture.sqlite');
+  buildFixture(dbPath);
+  const db = new DatabaseSync(dbPath);
+  try {
+    assert.equal(maxSequence(db, 'sess_does_not_exist'), -1);
+    // 表不存在 → 异常 → null（调用方据此放弃对账而非误判未送达）
+    db.exec('DROP TABLE message');
+    assert.equal(maxSequence(db, 'sess_t1'), null);
+    assert.equal(reconcileInjection(db, 'sess_t1', 0), 'unknown');
+  } finally { db.close(); }
+});
+t('state: indeterminate 按 indeterminateAt 取较新，清除后不被旧快照复活', () => {
+  const dir = mkTmp('ac-ind-');
+  const path = join(dir, 'state.json');
+  const now = Date.now();
+  // 磁盘：已登记待对账
+  const disk = emptyState();
+  const de = sessionEntry(disk, 's1');
+  de.indeterminate = { turnId: 'turn_a', preSeq: 5, at: now };
+  de.indeterminateAt = now;
+  writeState(disk, path);
+  assert.equal(readState(path).sessions.s1.indeterminate.turnId, 'turn_a');
+  // 陈旧快照（对账前的内存副本）不应把已清除的 indeterminate 复活
+  const stale = readState(path);
+  const se = sessionEntry(stale, 's1');
+  se.indeterminate = null;
+  se.indeterminateAt = now + 1000; // 清除时刻更晚
+  writeState(stale, path);
+  assert.equal(readState(path).sessions.s1.indeterminate, null, '已对账清除的标记不得被旧快照复活');
 });
 
 console.log(`\nAll ${n} assertions passed.`);
