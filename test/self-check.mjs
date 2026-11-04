@@ -18,12 +18,12 @@ import {
 } from '../lib/core.mjs';
 import { readState, writeState, sessionEntry, consumeSuppress, consumeInjectMarker, emptyState, pruneSessions, STATE_DIR } from '../lib/state.mjs';
 import { readStats, writeStats } from '../lib/stats.mjs';
-import { writeFileSync, unlinkSync, rmSync, mkdtempSync } from 'node:fs';
+import { writeFileSync, unlinkSync, rmSync, mkdtempSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { normalizeInput, decide } from '../hooks/stop.mjs';
 import { parseDuration, parseCommand } from '../hooks/user-prompt-submit.mjs';
-import { classifyTurn, fetchLastErrorFacts } from '../lib/watcher.mjs';
+import { classifyTurn, fetchLastErrorFacts, resolveZcodeBin } from '../lib/watcher.mjs';
 import { DatabaseSync } from 'node:sqlite';
 import { buildFixture } from './make-fixture.mjs';
 
@@ -83,6 +83,33 @@ t('resolveConfig overrides + invalid values fall back', () => {
   assert.equal(c.graceMs, 3000);       // 负数回退默认
   assert.equal(c.locale, 'zh');        // 未知 locale 回退
   assert.equal(c.continueText, 'go on');
+});
+
+// ---- resolveZcodeBin：CLI 入口解析（原为硬编码盘符）----
+t('resolveZcodeBin: 由宿主注入的 ZCODE_WINDOWS_APP_INSTALL_DIR 推导', () => {
+  const dir = mkTmp('ac-bin-');
+  const fake = join(dir, 'resources', 'glm');
+  mkdirSync(fake, { recursive: true });
+  writeFileSync(join(fake, 'zcode.cjs'), '// fake cli\n');
+  const saved = process.env.ZCODE_WINDOWS_APP_INSTALL_DIR;
+  process.env.ZCODE_WINDOWS_APP_INSTALL_DIR = dir;
+  try {
+    assert.equal(resolveZcodeBin(), join(dir, 'resources', 'glm', 'zcode.cjs'));
+  } finally {
+    if (saved === undefined) delete process.env.ZCODE_WINDOWS_APP_INSTALL_DIR;
+    else process.env.ZCODE_WINDOWS_APP_INSTALL_DIR = saved;
+  }
+});
+t('resolveZcodeBin: installDir 无效时不返回它（回退，不产生不存在路径）', () => {
+  const saved = process.env.ZCODE_WINDOWS_APP_INSTALL_DIR;
+  process.env.ZCODE_WINDOWS_APP_INSTALL_DIR = join(mkTmp('ac-bin-bad-'), 'nope');
+  try {
+    const r = resolveZcodeBin();
+    assert.equal(r.includes('nope'), false, '不得返回由无效 installDir 拼出的路径');
+  } finally {
+    if (saved === undefined) delete process.env.ZCODE_WINDOWS_APP_INSTALL_DIR;
+    else process.env.ZCODE_WINDOWS_APP_INSTALL_DIR = saved;
+  }
 });
 
 // ---- isTransientFailure ----
