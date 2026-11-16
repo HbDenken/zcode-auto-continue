@@ -23,7 +23,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { normalizeInput, decide } from '../hooks/stop.mjs';
 import { parseDuration, parseCommand } from '../hooks/user-prompt-submit.mjs';
-import { classifyTurn, fetchLastErrorFacts, resolveZcodeBin, maxSequence, reconcileInjection, reconcileAction } from '../lib/watcher.mjs';
+import { classifyTurn, fetchLastErrorFacts, resolveZcodeBin, maxSequence, reconcileInjection, reconcileAction, rearmStopped } from '../lib/watcher.mjs';
 import { DatabaseSync } from 'node:sqlite';
 import { buildFixture } from './make-fixture.mjs';
 
@@ -295,6 +295,18 @@ t('classifyText: empty → null', () => {
   assert.equal(classifyText('   '), null);
 });
 
+t('classifyText: provider_code=timeout transient', () => {
+  // 宿主把 error.providerCode 拼成 provider_code=<code>；timeout 必须重试。
+  assert.equal(classifyText('Error: Turn execution failed provider_code=timeout'), 'transient');
+});
+
+t('classifyText: bare Turn execution failed null', () => {
+  // 同一句 stderr 既可能是超时也可能是永久错误（实测有 Select a model），
+  // 没有 provider_code 等成因标记时不分类，避免把永久错误当临时重试。
+  assert.equal(classifyText('Error: Turn execution failed (traceId: 1234)'), null);
+  assert.equal(classifyText('Error: Select a model before sending a message'), null);
+});
+
 // ---- classifyTruncation ----
 t('classifyTruncation: unclosed code fence', () => {
   assert.equal(classifyTruncation('x'.repeat(300) + '\n```js\nconst x = 1;'), 'truncation');
@@ -422,17 +434,21 @@ t('state: writeState merges (no lost-update)', () => {
   assert.equal(merged.sessions['sess-b'].handled[0], 't2'); // 内存新增会话
 });
 t('state: writeState keeps suppress if only disk has it', () => {
-  const path = `${STATE_DIR}\\state-test-${process.pid}.json`;
+  // 用临时目录隔离，别碰真实 STATE_DIR（旧版写 STATE_DIR\state-test-*.json，
+  // 依赖运行环境目录可写，实测 EPERM 会中断整条断言链）。
+  const dir = mkTmp('ac-suppress-');
+  const path = join(dir, 'state.json');
   const disk = emptyState();
   disk.suppress = { sessionId: 'sess-x', setAt: Date.now() };
   writeState(disk, path);
   const stale = emptyState(); // 内存无 suppress
   writeState(stale, path);     // merge 应保留磁盘上的豁免（未清除）
   assert.deepEqual(readState(path).suppress, disk.suppress);
-  unlinkSync(path);
 });
 t('state: consumeSuppress tombstone prevents resurrection', () => {
-  const path = `${STATE_DIR}\\state-test-${process.pid}.json`;
+  // 同 mkTmp 隔离：真实 STATE_DIR 写盘依赖环境权限，失败会让断言链中断并残留文件。
+  const dir = mkTmp('ac-tomb-');
+  const path = join(dir, 'state.json');
   const disk = emptyState();
   disk.suppress = { sessionId: 'sess-x', setAt: Date.now() };
   writeState(disk, path);
@@ -445,7 +461,6 @@ t('state: consumeSuppress tombstone prevents resurrection', () => {
   stale.suppress = { sessionId: 'sess-x', setAt: Date.now() - 10000 };
   writeState(stale, path); // merge: 清除时刻晚于豁免 setAt → 已清除
   assert.equal(readState(path).suppress, null);
-  unlinkSync(path);
 });
 
 // ---- stop.mjs: normalizeInput ----
@@ -977,6 +992,44 @@ t('reconcileAction: 返回值必须都在已知动作集合内（穷举全部组
       }
     }
   }
+});
+
+// ---- rearmStopped：stopped 会话复燃 ----
+t('rearmStopped: 未超窗口不复燃', () => {
+  const now = 1000000000000;
+  const e = { stopped: true, consecutive: 3, lastAttemptAt: now - 60000, resetAt: 0, failedCount: 1, repeats: 2, lastHash: 'x' };
+  assert.equal(rearmStopped(e, { stoppedRetryAfterMs: 900000, maxConsecutive: 3 }, now), false);
+  assert.equal(e.stopped, true);
+});
+t('rearmStopped: 超窗复燃，复位计数', () => {
+  const now = 1000000000000;
+  const e = { stopped: true, consecutive: 3, lastAttemptAt: now - 900001, resetAt: 0, failedCount: 1, repeats: 2, lastHash: 'x' };
+  assert.equal(rearmStopped(e, { stoppedRetryAfterMs: 900000, maxConsecutive: 3 }, now), true);
+  assert.equal(e.stopped, false);
+  assert.equal(e.consecutive, 0);
+  assert.equal(e.failedCount, 0);
+  assert.equal(e.repeats, 0);
+  assert.equal(e.lastHash, '');
+  assert.equal(e.resetAt, now);
+});
+t('rearmStopped: resetAt 较新时以 resetAt 计时（hook give-up 路径）', () => {
+  const now = 1000000000000;
+  const e = { stopped: true, consecutive: 3, lastAttemptAt: now - 3600000, resetAt: now - 100, failedCount: 0, repeats: 0, lastHash: '' };
+  assert.equal(rearmStopped(e, { stoppedRetryAfterMs: 900000, maxConsecutive: 3 }, now), false);
+});
+t('rearmStopped: stoppedRetryAfterMs=0 关闭复燃', () => {
+  const e = { stopped: true, consecutive: 3, lastAttemptAt: 0, resetAt: 0 };
+  assert.equal(rearmStopped(e, { stoppedRetryAfterMs: 0, maxConsecutive: 3 }, 1000000000000), false);
+  assert.equal(e.stopped, true);
+});
+t('rearmStopped: 未 stopped 不触发', () => {
+  const e = { stopped: false, consecutive: 3, lastAttemptAt: 0, resetAt: 0 };
+  assert.equal(rearmStopped(e, { stoppedRetryAfterMs: 900000, maxConsecutive: 3 }, 1000000000000), false);
+});
+t('resolveConfig: stoppedRetryAfterMs 默认关闭（自动重试不超过 3 次），仅正数开启', () => {
+  assert.equal(resolveConfig({}).stoppedRetryAfterMs, 0);
+  assert.equal(resolveConfig({ stoppedRetryAfterMs: -1 }).stoppedRetryAfterMs, 0);
+  assert.equal(resolveConfig({ stoppedRetryAfterMs: 900000 }).stoppedRetryAfterMs, 900000);
 });
 
 console.log(`\nAll ${n} assertions passed.`);
