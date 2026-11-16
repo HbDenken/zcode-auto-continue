@@ -178,6 +178,9 @@ async function main() {
     }
     if (d.action === 'give-up') {
       entry.stopped = true;
+      // 写 resetAt：一是让合并判据（含 resetAt）认得这次写入，
+      // 二是 watcher 复燃窗口的计时起点（hook give-up 不写 lastAttemptAt）。
+      entry.resetAt = Date.now();
       writeState(state);
       record('gaveUp');
       log(`give-up ${input.sessionId}: ${d.reason}`);

@@ -10,6 +10,7 @@
   "retryableErrorPatterns": "",
   "backoffFactor": 2,
   "backoffMaxMs": 300000,
+  "stoppedRetryAfterMs": 0,
   "paused": false,
   "loopGuardRepeats": 3,
   "maxErrorLength": 500,
