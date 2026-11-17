@@ -28,7 +28,9 @@ import { DatabaseSync } from 'node:sqlite';
 const dbPath = process.env.ZCODE_DB;
 if (!dbPath) { console.error('ZCODE_DB not set; refusing to touch real db'); process.exit(9); }
 const sid = process.argv[process.argv.indexOf('--resume') + 1];
-const db = new DatabaseSync(dbPath);
+// timeout = busy timeout：watcher 此时很可能还持有只读连接（SHARED 锁），
+// 默认 0ms 会立即 SQLITE_BUSY 失败，把"已送达"的夹具变成伪失败。
+const db = new DatabaseSync(dbPath, { timeout: 5000 });
 const max = db.prepare('SELECT COALESCE(MAX(sequence),0) m FROM message WHERE session_id=?').get(sid).m;
 db.prepare('INSERT INTO message (id,session_id,time_created,time_updated,data,sequence) VALUES (?,?,?,?,?,?)')
   .run('inj_'+Date.now(), sid, Date.now(), Date.now(),
@@ -45,7 +47,7 @@ import { DatabaseSync } from 'node:sqlite';
 const dbPath = process.env.ZCODE_DB;
 if (!dbPath) { console.error('ZCODE_DB not set; refusing to touch real db'); process.exit(9); }
 const sid = process.argv[process.argv.indexOf('--resume') + 1];
-const db = new DatabaseSync(dbPath);
+const db = new DatabaseSync(dbPath, { timeout: 5000 }); // 同上：避让 watcher 的只读连接
 const max = db.prepare('SELECT COALESCE(MAX(sequence),0) m FROM message WHERE session_id=?').get(sid).m;
 db.prepare('INSERT INTO message (id,session_id,time_created,time_updated,data,sequence) VALUES (?,?,?,?,?,?)')
   .run('inj_'+Date.now(), sid, Date.now(), Date.now(),
@@ -66,7 +68,7 @@ async function runScenario(label, mockSource, { waitMs = 20000, extraErrorTurn =
   buildFixture(dbPath);
   // fixture 的 directory 是占位值 K:\test，spawn 时 cwd 不存在会 ENOENT；改成本次临时目录
   {
-    const d = new DatabaseSync(dbPath);
+    const d = new DatabaseSync(dbPath, { timeout: 5000 });
     d.prepare('UPDATE session SET directory = ?').run(dir);
     if (extraErrorTurn) {
       // 同一会话补第二个 error 回合：用于验证 per-session 在途互斥，
@@ -168,6 +170,8 @@ const ok = (name) => { n++; console.log(`ok ${n} - ${name}`); };
   assert.equal(r.resumes, 1, `已受理（非 0 退出）时不得重试，实际 ${r.resumes} 次\n` + r.out);
   assert.equal(r.state?.sess_t1?.handled?.includes('turn_sess_t1'), true, '应登记 handled');
   assert.equal(r.state?.sess_t1?.failedCount, 0, '不应计入失败次数');
+  // 回归 R1：失败回调必须立刻对账，不能因共享连接已 close 而拖到下一轮 indeterminate。
+  assert.equal(r.indeterminates, 0, `失败回调应立刻对账，实际落入 indeterminate ${r.indeterminates} 次\n` + r.out);
   ok('已受理但非 0 退出 → 对账确认已送达，不重试（回归 H2：不只堵超时）');
 }
 

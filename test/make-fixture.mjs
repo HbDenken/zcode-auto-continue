@@ -65,6 +65,9 @@ export function buildFixture(outPath) {
   mkdirSync(dirname(outPath), { recursive: true });
   rmSync(outPath, { force: true });
   const db = new DatabaseSync(outPath);
+  // 真实库是 WAL（磁盘上有 db.sqlite-wal / -shm）。WAL 下读不阻塞写，能避免
+  // 夹具里 mock 客户端写 INSERT 时撞上 watcher 只读连接的 SHARED 锁而伪失败。
+  db.exec('PRAGMA journal_mode = WAL');
   db.exec(SCHEMA);
 
   const now = Date.now();

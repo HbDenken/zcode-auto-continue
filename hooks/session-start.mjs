@@ -8,7 +8,7 @@
  * 的 watcher 进程，然后 hook 立即退出——不阻塞会话启动。
  */
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, openSync, readFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -54,6 +54,9 @@ function ensureWatcher() {
     child.unref();
   } catch (e) {
     return { status: 'error', message: e?.message || String(e) };
+  } finally {
+    // 子进程拿到的是 dup 后的句柄，父进程这份必须关掉，否则每次 SessionStart 泄漏一个 fd。
+    if (typeof logFd === 'number') { try { closeSync(logFd); } catch {} }
   }
   // 不在 hook 侧写 pid 文件：watcher 自己用独占创建（wx）抢锁决定谁是唯一实例。
   // 原实现在这里无条件写 pid，两个并发 SessionStart 会各自 spawn 一个 watcher
@@ -84,4 +87,11 @@ async function main() {
   );
 }
 
-main();
+main().catch(() => {
+  // 宿主对 hook 退出码的处理（zcode.cjs processHookExecutionResult）：
+  //   0        → 解析 stdout 的 HookJSONOutput，非法 JSON 直接抛 ToolExecutionFailed；
+  //   2        → createExitCodeBlockOutput，非 Stop 事件返回 {continue:false, reason}；
+  //   其它非 0 → 抛 ToolExecutionFailed。
+  // 后两种情况都可能让 SessionStart 阻断会话启动，所以所有异常都必须吞掉。
+  process.exitCode = 0;
+});

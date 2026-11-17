@@ -152,10 +152,10 @@ async function main() {
 
     const d = decide({
       input, entry, cfg,
-      // ZCode 引擎对 Stop decision:block 有 3 次硬上限（不可配置）。
-      // 超过 3 次后引擎会静默丢弃 block，插件无法感知。
-      // 这里用 min 兜底：hook 路径最多续跑 3 次，之后主动 give-up，
-      // 留给 watcher 通过 --resume 突破 3 次限制（watcher 不受此约束）。
+      // hook 路径自限 3 次：到达后主动 give-up，把会话交给 watcher 用 --resume 续跑。
+      // 注：旧注释声称"引擎对 Stop decision:block 有 3 次硬上限"，2026-11-17 在本机
+      // zcode.cjs 中未定位到该计数断言，故这里的 3 是自限而非引擎约束；若引擎确有
+      // 上限，这一行同样成立（min 取小）。
       maxHookRetries: Math.min(cfg.maxConsecutive, 3),
       loopGuardRepeats: cfg.loopGuardRepeats,
     });
@@ -171,7 +171,7 @@ async function main() {
         entry.consecutive = 0; entry.stopped = true;
         entry.resetAt = Date.now();
         writeState(state);
-        record('skipped', d.kind);
+        record('skipped');
         log(`skip ${input.sessionId}: ${d.reason}`);
       }
       return;
@@ -192,6 +192,10 @@ async function main() {
       return;
     }
 
+    // 干跑：只记日志，不动共享状态。原实现把 DRY 判在写 state 之后，干跑会把
+    // consecutive/hookTurnIds/lastHash 写进真实状态。
+    if (DRY) { log(`DRY-RUN ${input.sessionId} kind=${d.kind} 将续跑：${d.text.slice(0, 80)}`); return; }
+
     // block 续跑：更新共享计数。
     entry.consecutive += 1;
     entry.lastAttemptAt = Date.now();
@@ -204,8 +208,7 @@ async function main() {
     writeState(state);
     log(`block ${input.sessionId} #${entry.consecutive} kind=${d.kind} "${d.text.slice(0, 80)}"`);
 
-    if (DRY) { log(`DRY-RUN: 不输出 block`); return; }
-    record('sent', d.kind);
+    record('sent');
     process.stdout.write(JSON.stringify({ decision: 'block', reason: d.text }));
   } catch (e) {
     log(`error ${input.sessionId}: ${e?.stack || e}`);

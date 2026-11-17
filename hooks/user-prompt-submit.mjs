@@ -18,7 +18,7 @@
  */
 import { readState, writeState, sessionEntry, consumeInjectMarker, STATE_DIR } from '../lib/state.mjs';
 import { resolveConfig } from '../lib/core.mjs';
-import { existsSync, appendFileSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, appendFileSync, readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 
 const CONFIG_PATH = process.env.ZCODE_AC_CONFIG || join(STATE_DIR, 'config.json');
@@ -52,18 +52,28 @@ export function parseDuration(raw) {
 
 /** 识别 /auto-continue 子命令。非命令返回 null。 */
 export function parseCommand(prompt) {
-  const m = /^\/auto-continue(?:\s+(\S+))?(?:\s+(\S+))?\s*$/i.exec(String(prompt || '').trim());
+  // 第二个分组放宽到"剩余任意文本"，再取首词：原正则要求恰好两个参数，
+  // `/auto-continue pause 10m 谢谢` 会匹配失败 → 被当真实提示词发给模型并重置计数。
+  const m = /^\/auto-continue(?:\s+(\S+))?(?:\s+([\s\S]*))?$/i.exec(String(prompt || '').trim());
   if (!m) return null;
-  return { sub: (m[1] || 'status').toLowerCase(), arg: m[2] };
+  const arg = m[2] ? m[2].trim().split(/\s+/)[0] : undefined;
+  return { sub: (m[1] || 'status').toLowerCase(), arg };
 }
 
 function setPausedFlag(value) {
   try {
     mkdirSync(STATE_DIR, { recursive: true });
     let cfg = {};
-    if (existsSync(CONFIG_PATH)) { try { cfg = JSON.parse(readFileSync(CONFIG_PATH, 'utf8')); } catch {} }
+    if (existsSync(CONFIG_PATH)) {
+      // 解析失败时绝不能继续写：原实现用 {} 兜底后整份覆盖，会把用户的
+      // continueText / cooldownMs / 自定义 patterns 全部清空。
+      try { cfg = JSON.parse(readFileSync(CONFIG_PATH, 'utf8')); } catch { return false; }
+    }
     cfg.paused = value;
-    writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+    // 原子写：直写被中断会留下半截 JSON，下次 loadConfig 静默回退默认值。
+    const tmp = `${CONFIG_PATH}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(cfg, null, 2));
+    renameSync(tmp, CONFIG_PATH);
     return true;
   } catch {
     return false;

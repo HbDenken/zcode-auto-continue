@@ -1032,4 +1032,32 @@ t('resolveConfig: stoppedRetryAfterMs 默认关闭（自动重试不超过 3 次
   assert.equal(resolveConfig({ stoppedRetryAfterMs: 900000 }).stoppedRetryAfterMs, 900000);
 });
 
+// ---- 第三轮审查回归（2026-11-17）----
+t('isTransientFailure: 模型下线/EOL 判永久（回归 R2）', () => {
+  const m = "The model 'DeepSeek-V4.1-Flash' has reached its end of life on 2026-11-16T08:00:00Z and is no longer available.";
+  assert.equal(isTransientFailure({ code: 'unknown_error', message: m }), false);
+  assert.equal(isTransientFailure({ code: 'UNKNOWN_ERROR', status: 500, message: 'upstream connection lost' }), true);
+});
+t('classifyText: 模型下线横幅判 permanent（回归 R2）', () => {
+  assert.equal(classifyText("The model 'X' has reached its end of life and is no longer available."), 'permanent');
+});
+t('consumeInjectMarker: windowMs=0 视为关闭，不吞真人输入（回归 R13）', () => {
+  const s = emptyState();
+  sessionEntry(s, 's1').injectAt = Date.now();
+  assert.equal(consumeInjectMarker(s, 's1', 0), false);
+  assert.equal(s.sessions.s1.injectAt > 0, true);
+  assert.equal(consumeInjectMarker(s, 's1', 60000), true);
+});
+t('stats: delivered 计入快照并参与合并（回归 R5）', () => {
+  const dir = mkTmp('ac-stats2-');
+  const path = join(dir, 'stats.json');
+  assert.equal(emptyDayStats().delivered, 0);
+  const a = readStats(path); a.delivered += 1; writeStats(a, path);
+  const b = readStats(path); b.delivered += 1; writeStats(b, path);
+  assert.equal(readStats(path).delivered, 2);
+});
+t('parseCommand: 容忍多余参数（回归 R15）', () => {
+  assert.deepEqual(parseCommand('/auto-continue pause 10m 谢谢'), { sub: 'pause', arg: '10m' });
+});
+
 console.log(`\nAll ${n} assertions passed.`);

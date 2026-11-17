@@ -18,7 +18,10 @@ argument-hint: [status|stats|pause [时长]|resume|skip-once]
    - 读取并汇总当日统计：`~/.zcode/auto-continue/stats-<今日日期>.json`。
 
 2. **若包含 `stats`**：
-   - 读取并结构化展示：`~/.zcode/auto-continue/stats-*.json`（sent 发送 / skipped 跳过 / recovered 恢复成功 / gaveUp 达到上限放弃 / byCode 错误码分布）。
+   - 读取并结构化展示：`~/.zcode/auto-continue/stats-*.json`（sent 已发出注入 / delivered 确认已落库 /
+     skipped 判定为不可续跑 / recovered 续跑后回合成功 / failed 确认未送达 / gaveUp 达到上限放弃 /
+     byCode 错误码分布）。
+   - 注意：`delivered` 只代表消息进了库，不代表回合成功；回合是否恢复看 `recovered`。
 
 3. **若包含 `pause`**：
    - 钩子已写状态：带时长（如 `10m`）写入 `state.json` 的 `pausedUntil`（到期自动恢复），
