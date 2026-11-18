@@ -3,29 +3,10 @@
  * 核心逻辑自检（assert-based，无框架）。运行：node test/self-check.mjs
  */
 import assert from 'node:assert/strict';
-import {
-  resolveConfig,
-  isTransientFailure,
-  effectiveCooldown,
-  fillTemplate,
-  extractErrorFacts,
-  todayKey,
-  emptyDayStats,
-  classifyText,
-  classifyTruncation,
-  classifyDangling,
-  loopGuardHash,
-} from '../lib/core.mjs';
-import { readState, writeState, sessionEntry, consumeSuppress, consumeInjectMarker, emptyState, pruneSessions, STATE_DIR } from '../lib/state.mjs';
-import { readStats, writeStats } from '../lib/stats.mjs';
 import { writeFileSync, unlinkSync, rmSync, mkdtempSync, mkdirSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { normalizeInput, decide } from '../hooks/stop.mjs';
-import { parseDuration, parseCommand } from '../hooks/user-prompt-submit.mjs';
-import { classifyTurn, fetchLastErrorFacts, resolveZcodeBin, maxSequence, reconcileInjection, reconcileAction, rearmStopped } from '../lib/watcher.mjs';
 import { DatabaseSync } from 'node:sqlite';
-import { buildFixture } from './make-fixture.mjs';
 
 let n = 0;
 function t(name, fn) {
@@ -48,6 +29,31 @@ function mkTmp(prefix) {
 process.on('exit', () => {
   for (const d of tmpDirs) { try { rmSync(d, { recursive: true, force: true }); } catch {} }
 });
+
+// 测试绝不碰真实 ~/.zcode/auto-continue：lib/* 的 STATE_DIR 在模块加载时固化，
+// 而静态 import 先于任何用户代码执行，所以必须先设 env 再动态加载项目模块。
+// 回归：persistWarn 会把测试触发的写盘失败追加进真实 watcher.log（2026-11-18 实测 4 条）。
+process.env.ZCODE_AC_STATE = mkTmp('ac-selfcheck-');
+
+const {
+  resolveConfig,
+  isTransientFailure,
+  effectiveCooldown,
+  fillTemplate,
+  extractErrorFacts,
+  todayKey,
+  emptyDayStats,
+  classifyText,
+  classifyTruncation,
+  classifyDangling,
+  loopGuardHash,
+} = await import('../lib/core.mjs');
+const { readState, writeState, sessionEntry, consumeSuppress, consumeInjectMarker, emptyState, pruneSessions, STATE_DIR } = await import('../lib/state.mjs');
+const { readStats, writeStats } = await import('../lib/stats.mjs');
+const { normalizeInput, decide } = await import('../hooks/stop.mjs');
+const { parseDuration, parseCommand } = await import('../hooks/user-prompt-submit.mjs');
+const { classifyTurn, fetchLastErrorFacts, resolveZcodeBin, maxSequence, reconcileInjection, reconcileAction, rearmStopped } = await import('../lib/watcher.mjs');
+const { buildFixture } = await import('./make-fixture.mjs');
 
 /** 写一个临时 transcript JSONL，返回路径（调用方负责 unlinkSync）。 */
 let trSeq = 0;
