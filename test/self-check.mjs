@@ -18,7 +18,7 @@ import {
 } from '../lib/core.mjs';
 import { readState, writeState, sessionEntry, consumeSuppress, consumeInjectMarker, emptyState, pruneSessions, STATE_DIR } from '../lib/state.mjs';
 import { readStats, writeStats } from '../lib/stats.mjs';
-import { writeFileSync, unlinkSync, rmSync, mkdtempSync, mkdirSync } from 'node:fs';
+import { writeFileSync, unlinkSync, rmSync, mkdtempSync, mkdirSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { normalizeInput, decide } from '../hooks/stop.mjs';
@@ -1058,6 +1058,78 @@ t('stats: delivered 计入快照并参与合并（回归 R5）', () => {
 });
 t('parseCommand: 容忍多余参数（回归 R15）', () => {
   assert.deepEqual(parseCommand('/auto-continue pause 10m 谢谢'), { sub: 'pause', arg: '10m' });
+});
+
+// ---- 第四轮审查回归（2026-11-18）----
+t('isTransientFailure: 配额耗尽判永久，词序无关（回归 P0）', () => {
+  // 真实报文（providerErrorCode=1005）：与 "quota exceeded" 词序相反，旧正则漏判
+  assert.equal(isTransientFailure({ code: 'model_request_failed', message: 'exceed quota limit' }), false);
+  // 词序无关变体
+  assert.equal(isTransientFailure({ code: 'x', message: 'quota limit exceeded' }), false);
+  assert.equal(isTransientFailure({ code: 'x', message: 'credit used up' }), false);
+  assert.equal(isTransientFailure({ code: 'x', message: 'balance exhausted' }), false);
+  assert.equal(isTransientFailure({ code: 'x', message: '超出配额，请充值' }), false);
+  // 不误伤临时错误（rate limit 不含配额词）
+  assert.equal(isTransientFailure({ code: 'x', message: 'exceeded the rate limit for this project' }), true);
+  assert.equal(isTransientFailure({ code: 'x', message: 'Too many requests. Please slow down.' }), true);
+});
+t('classifyText: 配额耗尽判 permanent（回归 P0）', () => {
+  assert.equal(classifyText('exceed quota limit'), 'permanent');
+  assert.equal(classifyText('quota limit exceeded'), 'permanent');
+  assert.equal(classifyText('超出配额，请充值'), 'permanent');
+});
+t('extractErrorFacts: 读 attribution.statusCode 优先于文本提取（回归 P2）', () => {
+  const rows = [JSON.stringify({ role: 'assistant', error: { name: 'E', data: {
+    message: 'Model request failed.', code: 'model_request_failed',
+    attribution: { source: 'provider', statusCode: 410, retryable: false },
+  } } })];
+  const f = extractErrorFacts(rows);
+  assert.equal(f.status, 410);
+  assert.equal(isTransientFailure(f), false, '410（模型端点下线）应判永久');
+});
+t('extractErrorFacts: 读 attribution.providerErrorCode（回归 P2）', () => {
+  const rows = [JSON.stringify({ role: 'assistant', error: { name: 'E', data: {
+    message: 'Model request failed.', code: 'model_request_failed',
+    attribution: { source: 'provider', providerErrorCode: 'timeout', retryable: false },
+  } } })];
+  const f = extractErrorFacts(rows);
+  assert.equal(f.providerCode, 'timeout');
+  assert.equal(isTransientFailure(f), true, 'providerCode=timeout 应判临时');
+});
+t('isTransientFailure: providerCode 确定性判定（回归 P2）', () => {
+  assert.equal(isTransientFailure({ code: 'm', message: 'Model request failed.', providerCode: 'timeout' }), true);
+  assert.equal(isTransientFailure({ code: 'm', message: 'Model request failed.', providerCode: 'rate_limit_exceeded' }), true);
+  assert.equal(isTransientFailure({ code: 'm', message: 'Model request failed.', providerCode: 'model_unavailable' }), false);
+  // 未知码不瞎猜：落入文本判定（message 是泛化文案 → 临时）
+  assert.equal(isTransientFailure({ code: 'm', message: 'Model request failed.', providerCode: 'weird_code' }), true);
+});
+t('isTransientFailure: HTTP 404/410 判永久，408/429 保持临时（回归 P2）', () => {
+  assert.equal(isTransientFailure({ code: 'x', status: 404, message: 'not found' }), false);
+  assert.equal(isTransientFailure({ code: 'x', status: 410, message: 'gone' }), false);
+  assert.equal(isTransientFailure({ code: 'x', status: 408, message: 'request timeout' }), true);
+  assert.equal(isTransientFailure({ code: 'x', status: 429, message: 'too many requests' }), true);
+});
+t('extractErrorFacts: 无 attribution 的旧载荷兼容（回归 P2）', () => {
+  const rows = [JSON.stringify({ role: 'assistant', error: { name: 'E', data: { message: 'HTTP 502', code: 'x' } } })];
+  const f = extractErrorFacts(rows);
+  assert.equal(f.status, 502);
+  assert.equal(f.providerCode, undefined);
+});
+t('extractErrorFacts: error 载荷平铺（无 .data）时退回 error 本身（回归 P2）', () => {
+  const rows = [JSON.stringify({ role: 'assistant', error: { name: 'E', message: 'flat message', code: 'C' } })];
+  const f = extractErrorFacts(rows);
+  assert.equal(f.code, 'C');
+  assert.equal(f.message, 'flat message');
+});
+t('writeState/writeStats: 写盘失败不残留 .tmp（回归 P1）', () => {
+  const dir = mkTmp('ac-tmp-leak-');
+  // 目标是已存在的目录 → writeFileSync(tmp) 成功、rename 与直写都失败
+  const target = join(dir, 'state.json');
+  mkdirSync(target);
+  writeState(readState(target), target);
+  writeStats(readStats(target), target);
+  const leftovers = readdirSync(dir).filter((f) => f.endsWith('.tmp'));
+  assert.deepEqual(leftovers, []);
 });
 
 console.log(`\nAll ${n} assertions passed.`);

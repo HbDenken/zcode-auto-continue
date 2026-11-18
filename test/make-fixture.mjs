@@ -6,7 +6,10 @@
  * 生成一个最小 schema 的 sqlite，覆盖 watcher 的全部分支：
  *   sess_t1  瞬时错误（upstream connection lost）      → 应续跑
  *   sess_t2  瞬时错误（Provider rate limited）          → 应续跑
+ *   sess_t3  瞬时错误（attribution.providerErrorCode=timeout）→ 应续跑
  *   sess_p1  永久错误（Insufficient balance）           → 应跳过
+ *   sess_p2  永久错误（exceed quota limit，词序回归）    → 应跳过
+ *   sess_p3  永久错误（attribution.statusCode=410）     → 应跳过
  *   sess_c1  用户取消（cancelled_by_user=1）            → 不处理
  *   sess_d1  已删除会话的瞬时错误                       → SQL 层过滤，不出现
  *   sess_s1  subagent_child 的瞬时错误                  → SQL 层过滤，不出现
@@ -42,13 +45,14 @@ CREATE TABLE turn_usage (
 );
 `;
 
-/** 带 error 的 assistant 消息。传 turnId 则带上 anchor.turnId（真实 ZCode 行为）。 */
-function assistantWithError(id, sessionId, seq, message, code, turnId) {
+/** 带 error 的 assistant 消息。传 turnId 则带上 anchor.turnId（真实 ZCode 行为）。
+ * extra 为 attribution 等附加字段（真实库 200/200 带 attribution）。 */
+function assistantWithError(id, sessionId, seq, message, code, turnId, extra) {
   return {
     id, sessionId, seq,
     data: JSON.stringify({
       role: 'assistant',
-      error: { name: 'AiSdkModelAdapterError', data: { message, code } },
+      error: { name: 'AiSdkModelAdapterError', data: { message, code, ...(extra || {}) } },
       ...(turnId ? { anchor: { turnId } } : {}),
     }),
   };
@@ -87,6 +91,14 @@ export function buildFixture(outPath) {
     { sid: 'sess_t1', status: 'error', err: 'upstream connection lost', code: 'STREAM', task: 'interactive', deleted: null, cancelled: 0 },
     { sid: 'sess_t2', status: 'error', err: 'Provider rate limited the model request.', code: 'RATE_LIMIT', task: 'interactive', deleted: null, cancelled: 0 },
     { sid: 'sess_p1', status: 'error', err: 'Insufficient balance. Please top up your account.', code: 'BALANCE', task: 'interactive', deleted: null, cancelled: 0 },
+    // 真实报文（providerErrorCode=1005）：词序与 "quota exceeded" 相反，旧正则漏判 → 白烧 3 次注入（回归 P0）
+    { sid: 'sess_p2', status: 'error', err: 'exceed quota limit', code: 'QUOTA', task: 'interactive', deleted: null, cancelled: 0 },
+    // attribution 结构化归因：statusCode=410（模型端点下线）应判永久（回归 P2）
+    { sid: 'sess_p3', status: 'error', err: 'Model request failed.', code: 'model_request_failed', task: 'interactive', deleted: null, cancelled: 0,
+      extra: { attribution: { source: 'provider', statusCode: 410, retryable: false } } },
+    // attribution.providerErrorCode=timeout：确定性判临时（回归 P2）
+    { sid: 'sess_t3', status: 'error', err: 'Model request failed.', code: 'model_request_failed', task: 'interactive', deleted: null, cancelled: 0,
+      extra: { attribution: { source: 'provider', providerErrorCode: 'timeout', retryable: false } } },
     { sid: 'sess_c1', status: 'cancelled', err: 'turn cancelled', code: 'TURN_CANCELLED', task: 'interactive', deleted: null, cancelled: 1 },
     { sid: 'sess_d1', status: 'error', err: 'upstream connection lost', code: 'STREAM', task: 'interactive', deleted: now, cancelled: 0 },
     { sid: 'sess_s1', status: 'error', err: 'upstream connection lost', code: 'STREAM', task: 'subagent_child', deleted: null, cancelled: 0 },
@@ -95,7 +107,7 @@ export function buildFixture(outPath) {
   for (const c of cases) {
     insSession.run(c.sid, 'proj_test', c.sid, 'K:\\test', c.sid, '0.17.1', c.task, JSON.stringify({ mode: 'yolo' }), c.deleted);
     insMsg.run(`um_${c.sid}`, c.sid, now - 2000, now - 2000, userRow('', '', 0).data, 1);
-    const a = assistantWithError(`am_${c.sid}`, c.sid, 2, c.err, c.code);
+    const a = assistantWithError(`am_${c.sid}`, c.sid, 2, c.err, c.code, undefined, c.extra);
     insMsg.run(a.id, c.sid, now - 1000, now - 1000, a.data, 2);
     insTurn.run(c.sid, `turn_${c.sid}`, `um_${c.sid}`, c.status, now - 5000, now - 3000, c.cancelled, 0, 'unknown_error', c.code);
   }
@@ -127,5 +139,5 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   console.log(`fixture written: ${out}`);
   console.log('用法：');
   console.log(`  ZCODE_DB="${out}" ZCODE_AC_STATE=<空目录> ZCODE_AC_DRY_RUN=1 node lib/watcher.mjs`);
-  console.log('预期：sess_t1/sess_t2/sess_w1 注入；sess_p1 跳过(permanent)；sess_c1 不处理；sess_d1/sess_s1 不出现。');
+  console.log('预期：sess_t1/sess_t2/sess_t3/sess_w1 注入；sess_p1/sess_p2/sess_p3 跳过(permanent)；sess_c1 不处理；sess_d1/sess_s1 不出现。');
 }

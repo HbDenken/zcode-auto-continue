@@ -153,9 +153,10 @@ async function main() {
     const d = decide({
       input, entry, cfg,
       // hook 路径自限 3 次：到达后主动 give-up，把会话交给 watcher 用 --resume 续跑。
-      // 注：旧注释声称"引擎对 Stop decision:block 有 3 次硬上限"，2026-11-17 在本机
-      // zcode.cjs 中未定位到该计数断言，故这里的 3 是自限而非引擎约束；若引擎确有
-      // 上限，这一行同样成立（min 取小）。
+      // 引擎侧确有同值硬上限（2026-11-18 在 zcode.cjs 定位：shouldContinueAfterStopHooks
+      // 要求 stopHookContinuationCount < voc 且 voc=3，block 的 reason 会进
+      // additionalContexts，故本插件输出 {decision:'block', reason} 的契约成立）；
+      // 这里取 min 是双保险：引擎上限存在与否都不越过 3。
       maxHookRetries: Math.min(cfg.maxConsecutive, 3),
       loopGuardRepeats: cfg.loopGuardRepeats,
     });
