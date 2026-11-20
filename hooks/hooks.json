@@ -8,7 +8,8 @@
             "type": "process",
             "command": "node",
             "args": ["${ZCODE_PLUGIN_ROOT}/hooks/session-start.mjs"],
-            "timeoutMs": 5000
+            "timeoutMs": 5000,
+            "onError": "allow"
           }
         ]
       }
@@ -21,7 +22,8 @@
             "command": "node",
             "args": ["${ZCODE_PLUGIN_ROOT}/hooks/stop.mjs"],
             "timeoutMs": 15000,
-            "statusMessage": "auto-continue: 检测回合结束原因，临时错误则自动继续"
+            "statusMessage": "auto-continue: 检测回合结束原因，临时错误则自动继续",
+            "onError": "allow"
           }
         ]
       }
@@ -34,7 +36,8 @@
             "command": "node",
             "args": ["${ZCODE_PLUGIN_ROOT}/hooks/user-prompt-submit.mjs"],
             "timeoutMs": 5000,
-            "statusMessage": "auto-continue: 人工介入重置续跑计数"
+            "statusMessage": "auto-continue: 人工介入重置续跑计数",
+            "onError": "allow"
           }
         ]
       }

@@ -1138,4 +1138,93 @@ t('writeState/writeStats: 写盘失败不残留 .tmp（回归 P1）', () => {
   assert.deepEqual(leftovers, []);
 });
 
+// ---- 第五轮审查回归（2026-11-20）----
+t('resolveConfig: locale 后缀随语言切换（回归：英文环境输出中英混排）', () => {
+  const zh = resolveConfig({});
+  assert.equal(zh.truncationSuffix.includes('截断'), true);
+  const en = resolveConfig({ locale: 'en' });
+  assert.equal(en.continueText, 'Continue');
+  for (const k of ['truncationSuffix', 'emptySuffix', 'danglingSuffix']) {
+    assert.equal(/[\u4e00-\u9fa5]/.test(en[k]), false, `${k} 不得含中文`);
+    assert.ok(en[k].length > 0);
+  }
+});
+t('parseCommand: 识别宿主展开后的命令正文（回归：pause/resume/skip-once 静默失效）', () => {
+  // 宿主把 /auto-continue pause 10m 展开成 commands/auto-continue.md 正文后，
+  // 钩子收到的是这段文本（$ARGUMENTS 已被替换）。
+  const expanded = (args) => `用户执行了 \`/auto-continue\` 命令。参数为：\`${args}\`。\n\n请帮助用户检查或管理 \`zcode-auto-continue\` 插件。`;
+  assert.deepEqual(parseCommand(expanded('pause 10m')), { sub: 'pause', arg: '10m' });
+  assert.deepEqual(parseCommand(expanded('resume')), { sub: 'resume', arg: undefined });
+  assert.deepEqual(parseCommand(expanded('skip-once')), { sub: 'skip-once', arg: undefined });
+  assert.equal(parseCommand(expanded('')).sub, 'status');
+  // 原始形式仍要工作（部分宿主不展开）
+  assert.deepEqual(parseCommand('/auto-continue pause 10m'), { sub: 'pause', arg: '10m' });
+  assert.equal(parseCommand('普通提示词'), null);
+});
+t('state: resume 能清除定时暂停（回归：pausedUntil 被 Math.max 复活）', () => {
+  const dir = mkTmp('ac-paused-');
+  const path = join(dir, 'state.json');
+  const paused = emptyState();
+  paused.pausedUntil = Date.now() + 7200000;
+  paused.pausedUntilSetAt = Date.now();
+  writeState(paused, path);
+  assert.ok(readState(path).pausedUntil > Date.now(), '暂停应先落盘');
+  // resume：写入 0 + 墓碑时间戳
+  const resumed = readState(path);
+  resumed.pausedUntil = 0;
+  resumed.pausedUntilSetAt = Date.now() + 1000;
+  writeState(resumed, path);
+  assert.equal(readState(path).pausedUntil, 0, 'resume 后 pausedUntil 必须归零');
+  // 陈旧快照（读于 resume 前）不得把暂停复活
+  const stale = paused;
+  writeState(stale, path);
+  assert.equal(readState(path).pausedUntil, 0, '旧快照不得复活已清除的暂停');
+});
+t('loopGuardHash: 长文本共享前 48 字节前缀也必须不同（回归：不是哈希）', () => {
+  const prefix = 'X'.repeat(60); // 超过旧实现 base64(48 bytes) 的覆盖范围
+  assert.notEqual(loopGuardHash(prefix + 'traceId=aaa'), loopGuardHash(prefix + 'traceId=bbb'));
+});
+t('isTransientFailure: 用户可重试片段覆盖 401 短路（回归：注释与代码矛盾）', () => {
+  // 无用户配置：401 判永久
+  assert.equal(isTransientFailure({ code: 'auth', status: 401, message: 'token expired' }), false);
+  // 用户显式声明可重试（如自建网关 401 会自动刷新 token）：必须生效
+  assert.equal(isTransientFailure({ code: 'auth', status: 401, message: 'token expired' }, 'token expired'), true);
+});
+t('normalizeInput: 提取 toolCallCount（供空回复判定）', () => {
+  assert.equal(normalizeInput({ tool_call_count: 3 }).toolCallCount, 3);
+  assert.equal(normalizeInput({ toolCallCount: 2 }).toolCallCount, 2);
+  assert.equal(normalizeInput({}).toolCallCount, 0);
+  assert.equal(normalizeInput({ toolCallCount: 'x' }).toolCallCount, 0);
+});
+t('decide: 空文本但本回合有工具调用 → pass（回归：工具收尾被误判为空回复）', () => {
+  const cfg = resolveConfig({});
+  const entry = sessionEntry(emptyState(), 's');
+  const tp = writeTranscript([{ role: 'assistant', content: [{ type: 'text', text: '' }] }]);
+  const d = decide({ input: { lastMessage: '', transcriptPath: tp, toolCallCount: 2 }, entry, cfg, maxHookRetries: 3, loopGuardRepeats: 3 });
+  assert.equal(d.action, 'pass');
+  unlinkSync(tp);
+});
+t('decide: 空文本且无工具调用 → 仍判 empty（不因修复而漏救）', () => {
+  const cfg = resolveConfig({});
+  const entry = sessionEntry(emptyState(), 's');
+  const tp = writeTranscript([{ role: 'assistant', content: [{ type: 'text', text: '' }] }]);
+  const d = decide({ input: { lastMessage: '', transcriptPath: tp, toolCallCount: 0 }, entry, cfg, maxHookRetries: 3, loopGuardRepeats: 3 });
+  assert.equal(d.action, 'block');
+  assert.equal(d.kind, 'empty');
+  unlinkSync(tp);
+});
+t('decide: en locale 的三类续跑文案都不含中文', () => {
+  const cfg = resolveConfig({ locale: 'en' });
+  const cases = [
+    'x'.repeat(300) + '\n```js\nconst x',                    // truncation
+    'Found the root cause. Let me pull the remaining regions.', // dangling
+  ];
+  for (const msg of cases) {
+    const entry = sessionEntry(emptyState(), 's');
+    const d = decide({ input: { lastMessage: msg }, entry, cfg, maxHookRetries: 3, loopGuardRepeats: 3 });
+    assert.equal(d.action, 'block', msg.slice(0, 20));
+    assert.equal(/[\u4e00-\u9fa5]/.test(d.text), false, `续跑文案不得含中文: ${d.text}`);
+  }
+});
+
 console.log(`\nAll ${n} assertions passed.`);

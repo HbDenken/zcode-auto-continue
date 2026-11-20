@@ -50,14 +50,30 @@ export function parseDuration(raw) {
   return n * factor;
 }
 
-/** 识别 /auto-continue 子命令。非命令返回 null。 */
+/**
+ * 识别 /auto-continue 子命令。非命令返回 null。
+ *
+ * 兼容两种输入形式：
+ *   1. 原始形式：`/auto-continue pause 10m`（部分宿主不展开自定义命令时直接到达）；
+ *   2. 展开形式：宿主在 executeTurn 前把自定义命令按 commands/auto-continue.md 模板
+ *      （"用户执行了 `/auto-continue` 命令。参数为：`$ARGUMENTS`。"）展开成正文，
+ *      UserPromptSubmit 钩子收到的是展开后的文本，原始 `/auto-continue` 前缀已不在。
+ *      旧实现只匹配原始形式 → 展开后永远匹配不到，pause/resume/skip-once 静默失效
+ *      （审查确认：宿主 runPromptTurn 先 customCommandPromptResolver 再 executeTurn）。
+ */
 export function parseCommand(prompt) {
-  // 第二个分组放宽到"剩余任意文本"，再取首词：原正则要求恰好两个参数，
-  // `/auto-continue pause 10m 谢谢` 会匹配失败 → 被当真实提示词发给模型并重置计数。
-  const m = /^\/auto-continue(?:\s+(\S+))?(?:\s+([\s\S]*))?$/i.exec(String(prompt || '').trim());
-  if (!m) return null;
-  const arg = m[2] ? m[2].trim().split(/\s+/)[0] : undefined;
-  return { sub: (m[1] || 'status').toLowerCase(), arg };
+  const text = String(prompt || '').trim();
+  // 原始形式
+  const raw = /^\/auto-continue(?:\s+(\S+))?(?:\s+([\s\S]*))?$/i.exec(text);
+  if (raw) {
+    const arg = raw[2] ? raw[2].trim().split(/\s+/)[0] : undefined;
+    return { sub: (raw[1] || 'status').toLowerCase(), arg };
+  }
+  // 展开形式：命令 doc 正文 + $ARGUMENTS 已被替换（如 "参数为：`pause 10m`"）
+  const expanded = /用户执行了\s*`\/auto-continue`\s*命令[。.]?\s*参数为[：:]\s*`([^`]*)`/.exec(text);
+  if (!expanded) return null;
+  const parts = (expanded[1] || '').trim().split(/\s+/).filter(Boolean);
+  return { sub: (parts[0] || 'status').toLowerCase(), arg: parts[1] };
 }
 
 function setPausedFlag(value) {
@@ -105,20 +121,32 @@ async function main() {
           log(`pause: 时长无法解析 "${cmd.arg}"，忽略`);
           return;
         }
+        // pausedUntilSetAt 墓碑：resume 写 0 时合并逻辑必须认得"这是新的清除意图"，
+        // 否则磁盘上的旧截止时间会被 Math.max 吞回来（审查复现：resume 无法取消定时暂停）。
         if (ms === null) {
-          setPausedFlag(true);
+          // 长期暂停必须依赖 config.paused=true：state 里没有"长期暂停"这个值，
+          // 若 config 写不进（配置损坏），暂停实际没生效，必须如实报出而非假装成功。
+          if (!setPausedFlag(true)) {
+            log('pause: config.json 写入失败，无法长期暂停（可先 /auto-continue pause 10m 定时暂停）');
+            return;
+          }
           state.pausedUntil = 0;
+          state.pausedUntilSetAt = Date.now();
           log(`pause: 长期暂停（config.paused=true）`);
         } else {
           state.pausedUntil = Date.now() + ms;
+          state.pausedUntilSetAt = Date.now();
           log(`pause: ${Math.round(ms / 1000)}s（到期自动恢复）`);
         }
         writeState(state);
         return;
       }
       if (cmd.sub === 'resume') {
-        setPausedFlag(false);
+        if (!setPausedFlag(false)) {
+          log('resume: config.json 写入失败（paused 标记可能仍为 true）');
+        }
         state.pausedUntil = 0;
+        state.pausedUntilSetAt = Date.now();
         writeState(state);
         log('resume: 已清除 paused / pausedUntil');
         return;

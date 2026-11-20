@@ -8,7 +8,7 @@ ZCode plugin for automatic retry on transient errors — ported from `dsh-auto-c
 - **Error classification**: Automatically retries transient errors (network, timeout, 5xx, 429), skips permanent errors (auth, billing, context overflow)
 - **Adaptive backoff**: Exponential backoff with configurable cap
 - **Truncation recovery**: Detects and retries truncated responses
-- **Empty response recovery**: Only when the transcript proves the last assistant turn had neither text nor tool calls (a turn that merely ended after tool calls is *not* treated as empty)
+- **Empty response recovery**: Only when the turn produced neither text nor any tool call (`toolCallCount` from the Stop payload is the authoritative signal — a turn that merely ended after tool calls is *not* treated as empty; the transcript alone cannot prove it, since the host writes it from the same final text)
 - **Dangling-intent recovery**: When a turn ends right after announcing the next step ("Found the root cause. Let me pull the remaining regions…") with no tool call and no result, the turn is resumed with an instruction to produce the actual result instead of another plan
 - **Loop guard**: Prevents infinite retry loops on identical errors
 - **turn.failed coverage**: DB polling catches `turn.failed` (architectural blind spot of pure hook plugins)

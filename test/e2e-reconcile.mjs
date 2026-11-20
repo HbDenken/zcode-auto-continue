@@ -215,4 +215,48 @@ const ok = (name) => { n++; console.log(`ok ${n} - ${name}`); };
   ok('注入成功后 failedCount 归零（回归 M1：否则会话会永久失去续跑能力）');
 }
 
+// ---- 场景 7：hook 续跑过的回合并未救回（最终 error）→ watcher 必须兜底重试 ----
+// 回归 P2-5：hookTurnIds 去重曾对 error 回合一并生效，正好抵消"DB polling 兜底 turn.failed"。
+{
+  const r = await runScenario('hook-turn-errored', MOCK_OK, {
+    waitMs: 6000,
+    preseed: {
+      sess_t1: {
+        consecutive: 1, lastAttemptAt: 0, stopped: false, handled: [],
+        lastHash: '', repeats: 0, resetAt: Date.now(), failedCount: 0,
+        injectAt: 0, injectConsumedAt: 0,
+        // Stop hook 已 block 续跑过 turn_sess_t1（该回合在 fixture 里是 status='error'）
+        hookTurnIds: ['turn_sess_t1'],
+        indeterminate: null, indeterminateAt: 0,
+      },
+    },
+  });
+  assert.equal(r.resumes, 1, `hook 续跑后仍然 error 的回合必须由 watcher 兜底，实际 ${r.resumes} 次\n` + r.out);
+  assert.equal(r.state?.sess_t1?.handled?.includes('turn_sess_t1'), true, '应登记 handled');
+  ok('hook 续跑过的回合仍是 error → watcher 兜底重试（回归 P2-5）');
+}
+
+// ---- 场景 8：遗留记录指向【本批次内的回合】→ 正常对账后重试（不得卡死） ----
+// 覆盖 P2-6 的另一半：旧记录所指回合本轮可达时，必须先对账、再处理，且不能因为
+// "推迟→对账→再推迟"形成 livelock。
+{
+  const r = await runScenario('same-turn-ind', MOCK_OK, {
+    waitMs: 6000,
+    preseed: {
+      sess_t1: {
+        consecutive: 1, lastAttemptAt: 0, stopped: false, handled: [],
+        lastHash: '', repeats: 0, resetAt: Date.now(), failedCount: 0,
+        injectAt: 0, injectConsumedAt: 0, hookTurnIds: [],
+        // 指向 fixture 里真实存在的回合；preSeq=0 → 无 CLI 落库 → 判未送达
+        indeterminate: { turnId: 'turn_sess_t1', preSeq: 0, at: Date.now() },
+        indeterminateAt: Date.now(),
+      },
+    },
+  });
+  assert.equal(r.reconciledUndelivered, 1, `应确认上次注入未送达，实际 ${r.reconciledUndelivered}\n` + r.out);
+  assert.equal(r.resumes, 1, `确认未送达后应重试一次，实际 ${r.resumes}\n` + r.out);
+  assert.equal(r.state?.sess_t1?.indeterminate, null, '对账完成后在途记录应清空');
+  ok('遗留记录指向本批次内回合 → 先对账再重试，不受阻（P2-6）');
+}
+
 console.log(`\nAll ${n} scenarios passed.`);

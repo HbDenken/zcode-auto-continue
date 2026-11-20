@@ -49,6 +49,13 @@ export function normalizeInput(raw) {
     lastMessage: String(pick(raw, 'last_assistant_message', 'lastAssistantMessage', 'responseText', 'responsePreview') ?? ''),
     transcriptPath: String(pick(raw, 'transcript_path', 'transcriptPath') || ''),
     stopHookActive: Boolean(pick(raw, 'stop_hook_active', 'stopHookActive')),
+    // 本回合的工具调用数（宿主 runStopHooks 传入，实测在 Stop 载荷里）。
+    // 这是"回合是否真的做了事"的唯一权威信号：transcript 与 last_assistant_message 同源，
+    // 无法证明"无工具调用"（见 inspectTranscript 注释）。
+    toolCallCount: (() => {
+      const v = Number(pick(raw, 'tool_call_count', 'toolCallCount'));
+      return Number.isFinite(v) && v > 0 ? v : 0;
+    })(),
     // 宿主在 Stop 载荷里带了 turnId（QWo → hookRunner.run 的 turnId）。
     // watcher 靠它做去重：hookResumeAt 与 completed_at 的时间序是错的——
     // Stop 钩子在【回合结束之前】执行，hookResumeAt 必然早于 completed_at，
@@ -59,12 +66,21 @@ export function normalizeInput(raw) {
 
 /**
  * 判定"无文本"是否该视为真空响应。
- * 原实现的 bug：`if (!kind && !msg.trim()) kind = 'empty'` —— 只凭 msg 为空就注入，
- * 导致以工具调用收尾的正常回合被反复注入"上次回复为空"（实测误伤本机审查会话）。
- * 现在要求 transcript 提供正面证据：最后一条 assistant 条目存在、且既无 text 又无 tool。
+ *
+ * 证据链（按可靠性从高到低）：
+ *   1. lastMessage 有文本 → 不是空响应；
+ *   2. toolCallCount > 0 → 本回合做过工具调用，以工具收尾后没有文本是【正常结束】
+ *      （README 承诺"a turn that merely ended after tool calls is *not* treated as empty"）；
+ *   3. transcript 可读且最后一条 assistant 既无 text 也无 tool → 真空响应。
+ *
+ * 原实现只用第 3 条：而 ZCode 的 transcript 内容恒等于 last_assistant_message
+ * （同一行纯 text，永不产出 tool part），hasText 与"lastMessage 非空"是同一个布尔，
+ * hasTool 分支不可达 → 逻辑退化成"text 为空即判 empty"，声称的"避免误伤工具收尾回合"
+ * 实际未实现。toolCallCount 补上了这个缺口。
  */
 export function resolveEmptyKind(input, cfg) {
   if (input.lastMessage.trim()) return null;
+  if (input.toolCallCount > 0) return null; // 做过工具调用：无文本是正常收尾
   if (cfg.scanTranscript === false) return null; // 显式关闭取证则不猜，保守放行
   const t = inspectTranscript(input.transcriptPath);
   if (!t.decisible) return null;      // 读不到 transcript：保守放行
@@ -114,13 +130,13 @@ export function decide({ input, entry, cfg, maxHookRetries, loopGuardRepeats }) 
   if (wait > 0) return { action: 'cooldown', kind, waitMs: wait, reason: 'hook 冷却中' };
 
   const text = kind === 'truncation'
-    ? fillTemplate(cfg.continueText, {}) + '（上次回复疑似被截断，请接着已输出内容继续，不要重复）'
+    ? fillTemplate(cfg.continueText, {}) + cfg.truncationSuffix
     : kind === 'empty'
-      ? fillTemplate(cfg.continueText, {}) + '（上次回复为空，请重新给出完整回复）'
+      ? fillTemplate(cfg.continueText, {}) + cfg.emptySuffix
       : kind === 'dangling'
         // 悬空意图：模型只说"让我…"就结束了，用户没拿到结果。
         // 明确要求直接给出结果，而不是又描述一遍下一步计划。
-        ? fillTemplate(cfg.continueText, {}) + '（上一轮只说了将要做什么就结束了，没有给出结果。请直接完成并给出结论/结果，不要再只描述下一步计划）'
+        ? fillTemplate(cfg.continueText, {}) + cfg.danglingSuffix
         : fillTemplate(cfg.continueText, { facts: { code: '', message: msg.slice(0, 200), status: '' }, errorCount: entry.consecutive + 1 });
 
   return { action: 'block', kind, text, repeats: effectiveRepeats, hash };
@@ -152,11 +168,14 @@ async function main() {
 
     const d = decide({
       input, entry, cfg,
-      // hook 路径自限 3 次：到达后主动 give-up，把会话交给 watcher 用 --resume 续跑。
-      // 引擎侧确有同值硬上限（2026-11-18 在 zcode.cjs 定位：shouldContinueAfterStopHooks
-      // 要求 stopHookContinuationCount < voc 且 voc=3，block 的 reason 会进
-      // additionalContexts，故本插件输出 {decision:'block', reason} 的契约成立）；
-      // 这里取 min 是双保险：引擎上限存在与否都不越过 3。
+      // hook 路径自限 3 次：到达后 give-up 并置 stopped，该会话停止自动续跑
+      // （直到用户输入、或某个回合正常完成后复位；可选 stoppedRetryAfterMs 复燃）。
+      // 注意：这不是"交给 watcher 继续"——Stop 钩子处理的回合最终状态是 completed，
+      // watcher 的 classifyTurn 对 completed 一律 none，结构上接不住；且 stopped 会让
+      // watcher 的续跑分支直接跳过。原注释写成"交给 watcher"是错的（审查确认）。
+      // 引擎侧确有同值硬上限（zcode.cjs：shouldContinueAfterStopHooks 要求
+      // stopHookContinuationCount < 3，block 的 reason 会进 additionalContexts，
+      // 故本插件输出 {decision:'block', reason} 的契约成立）；取 min 是双保险。
       maxHookRetries: Math.min(cfg.maxConsecutive, 3),
       loopGuardRepeats: cfg.loopGuardRepeats,
     });
